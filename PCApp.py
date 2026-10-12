@@ -9,6 +9,9 @@ st.set_page_config(page_title="Geological Petrography QC & Analysis", layout="wi
 
 st.title("🔬 Geological Petrography Analysis Platform")
 
+# Constant Scale
+SCALE_UM_PER_PX = 1.82  # 1.82 microns per pixel
+
 # ---------------------------------------------------------
 # 1. SAMPLE TYPES & DEFAULT LOOKUPS
 # ---------------------------------------------------------
@@ -38,7 +41,6 @@ DEFAULT_LOOKUPS = {
     }
 }
 
-# Helper: Abundance Classifier
 def classify_abundance(pct):
     if pct > 50.0:
         return "Major+"
@@ -49,7 +51,6 @@ def classify_abundance(pct):
     else:
         return "Trace"
 
-# Helper: Nearest Neighbor Spatial Distribution Index (Clark-Evans R)
 def calculate_spatial_index(df_points):
     if len(df_points) < 5:
         return None, "Insufficient points"
@@ -61,7 +62,6 @@ def calculate_spatial_index(df_points):
     nearest_dists = np.min(dist_matrix, axis=1)
     mean_observed_dist = np.mean(nearest_dists)
     
-    # Calculate study area density
     x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
     y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
     area = (x_max - x_min) * (y_max - y_min)
@@ -113,6 +113,53 @@ if uploaded_file is not None:
     col4.metric("Total Gross Points", len(df_raw))
 
     # ---------------------------------------------------------
+    # NEW MODULE: POINT COUNT GEOMETRY & TRAVERSE METRICS
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.subheader("📐 Point Count Geometry & Traverse Metrics")
+    st.caption(f"Calculated using spatial coordinates at a scale of **{SCALE_UM_PER_PX} μm/pixel**.")
+
+    # Convert coordinates to microns & mm
+    df_raw["X_um"] = df_raw["X"] * SCALE_UM_PER_PX
+    df_raw["Y_um"] = df_raw["Y"] * SCALE_UM_PER_PX
+
+    x_min_um, x_max_um = df_raw["X_um"].min(), df_raw["X_um"].max()
+    y_min_um, y_max_um = df_raw["Y_um"].min(), df_raw["Y_um"].max()
+
+    width_um = x_max_um - x_min_um
+    height_um = y_max_um - y_min_um
+    width_mm = width_um / 1000.0
+    height_mm = height_um / 1000.0
+    area_mm2 = width_mm * height_mm
+
+    # Traverses (Unique Y rows) & Transects (Unique X columns)
+    unique_y = np.sort(df_raw["Y_um"].unique())
+    unique_x = np.sort(df_raw["X_um"].unique())
+
+    num_traverses = len(unique_y)
+    num_transects = len(unique_x)
+
+    # Spacing calculations
+    x_spacing_um = np.mean(np.diff(unique_x)) if len(unique_x) > 1 else 0.0
+    y_spacing_um = np.mean(np.diff(unique_y)) if len(unique_y) > 1 else 0.0
+
+    # Total Linear Traverse Distance = Number of Traverses * Row Width
+    total_linear_traverse_mm = num_traverses * width_mm
+
+    # Display Metrics in Cards
+    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+    m_col1.metric("X-Span (Width)", f"{width_mm:.2f} mm", f"{width_um:.0f} μm")
+    m_col2.metric("Y-Span (Height)", f"{height_mm:.2f} mm", f"{height_um:.0f} μm")
+    m_col3.metric("Total Bounding Area", f"{area_mm2:.2f} mm²")
+    m_col4.metric("Total Linear Traverse", f"{total_linear_traverse_mm:.2f} mm")
+
+    m_col5, m_col6, m_col7, m_col8 = st.columns(4)
+    m_col5.metric("Number of Traverses (Rows)", num_traverses)
+    m_col6.metric("Number of Transects (Cols)", num_transects)
+    m_col7.metric("X-Spacing (Point Step)", f"{x_spacing_um:.1f} μm")
+    m_col8.metric("Y-Spacing (Row Step)", f"{y_spacing_um:.1f} μm")
+
+    # ---------------------------------------------------------
     # STEP 2: QUALITY CONTROL & TAXONOMY MAPPING
     # ---------------------------------------------------------
     st.markdown("---")
@@ -136,7 +183,7 @@ if uploaded_file is not None:
     df_mapped = df_raw.copy()
     df_mapped["Standardized_Phase"] = df_mapped["Raw_Term"].map(mapping_dict)
 
-    # Filter out NA for modal analysis
+    # Exclude NA
     df_valid = df_mapped[df_mapped["Standardized_Phase"].str.upper() != "NA"].copy()
     valid_points_count = len(df_valid)
     na_count = len(df_mapped) - valid_points_count
@@ -152,11 +199,9 @@ if uploaded_file is not None:
     summary = df_valid.groupby("Standardized_Phase").size().reset_index(name="Point_Count")
     summary["Modal_Percent (%)"] = (summary["Point_Count"] / valid_points_count) * 100
     
-    # 2-Sigma Standard Error (Van der Plas & Tobi 1965)
     p = summary["Modal_Percent (%)"] / 100
     summary["Std_Error (%)"] = 2 * np.sqrt((p * (1 - p)) / valid_points_count) * 100
 
-    # Abundance Column for Aggregates & Rock
     if sample_type in ["Aggregates", "Rock"]:
         summary["Abundance"] = summary["Modal_Percent (%)"].apply(classify_abundance)
 
@@ -184,7 +229,6 @@ if uploaded_file is not None:
         st.markdown("---")
         st.subheader("🧱 Concrete - I.S.465 Aggregate Derivations")
         
-        # Filter for Good and Bad Aggregate
         good_agg_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Good Aggregate", case=False), "Point_Count"].sum()
         bad_agg_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Bad Aggregate", case=False), "Point_Count"].sum()
         total_agg_cnt = good_agg_cnt + bad_agg_cnt
@@ -202,17 +246,15 @@ if uploaded_file is not None:
             st.warning("No points classified as 'Good Aggregate' or 'Bad Aggregate' were found in the current mapping.")
 
     # ---------------------------------------------------------
-    # SPECIAL MODULE: QAPF Ternary Plot (Rock & Aggregates)
+    # SPECIAL MODULE: QAPF Ternary Plot
     # ---------------------------------------------------------
     if sample_type in ["Rock", "Aggregates"]:
         st.markdown("---")
         st.subheader("🔺 QAPF Ternary Classification")
         
-        # Look for Q, A, P, F constituents
         q_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Quartz", case=False), "Point_Count"].sum()
         a_cnt = summary.loc[summary["Standardized_Phase"].str.contains("K-Feldspar|Alkali", case=False), "Point_Count"].sum()
         p_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Plagioclase", case=False), "Point_Count"].sum()
-        f_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Feldspathoid", case=False), "Point_Count"].sum()
         
         qap_sum = q_cnt + a_cnt + p_cnt
         if qap_sum > 0:
@@ -238,8 +280,6 @@ if uploaded_file is not None:
                 'title': 'Q-A-P Ternary Plot'
             })
             st.plotly_chart(fig_ternary, use_container_width=True)
-        else:
-            st.info("Insufficient QAPF constituents (Quartz, K-Feldspar, Plagioclase) found to render ternary diagram.")
 
     # ---------------------------------------------------------
     # STEP 4: SPATIAL DISTRIBUTION & NEAREST NEIGHBOR INDEX
@@ -251,11 +291,11 @@ if uploaded_file is not None:
 
     with c_map:
         fig_scatter = px.scatter(
-            df_valid, x="X", y="Y", color="Standardized_Phase",
-            title="Spatial Point Distribution Across Thin Section",
-            labels={"X": "X Coordinate (px/μm)", "Y": "Y Coordinate (px/μm)"}
+            df_valid, x="X_um", y="Y_um", color="Standardized_Phase",
+            title="Spatial Point Distribution Across Thin Section (μm)",
+            labels={"X_um": "X Position (μm)", "Y_um": "Y Position (μm)"}
         )
-        fig_scatter.update_yaxes(autorange="reversed")  # Match image orientation
+        fig_scatter.update_yaxes(autorange="reversed")
         st.plotly_chart(fig_scatter, use_container_width=True)
 
     with c_index:
@@ -264,13 +304,6 @@ if uploaded_file is not None:
         if R_val is not None:
             st.metric("Nearest Neighbor Ratio (R)", f"{R_val:.3f}")
             st.info(f"**Interpretation:** {R_desc}")
-            st.caption(
-                "• **R = 1:** Random Spatial Distribution\n"
-                "• **R < 1:** Clustered / Segregated (e.g., veining, aggregate clumping)\n"
-                "• **R > 1:** Uniform / Regular Grid Distribution"
-            )
-        else:
-            st.write("Unable to calculate dispersion index.")
 
     # ---------------------------------------------------------
     # STEP 5: SAVE TO DATABASE & EXPORT
