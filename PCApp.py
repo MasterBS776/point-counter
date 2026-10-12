@@ -9,14 +9,14 @@ st.set_page_config(page_title="Geological Petrography QC & Analysis", layout="wi
 
 st.title("🔬 Geological Petrography Analysis Platform")
 
-# Constant Scale
 SCALE_UM_PER_PX = 1.82  # 1.82 microns per pixel
 
 # ---------------------------------------------------------
-# 1. SAMPLE TYPES & DEFAULT LOOKUPS
+# 1. SAMPLE TYPES & LOOKUPS
 # ---------------------------------------------------------
 SAMPLE_TYPES = [
     "Aggregates",
+    "Aggregate - Recycled",
     "Concrete - General",
     "Concrete - I.S.465",
     "Rock",
@@ -24,11 +24,33 @@ SAMPLE_TYPES = [
     "Render/Mortar"
 ]
 
+EN933_11_CLASSES = [
+    "Rc - Concrete & Mortar",
+    "Ru - Unbound / Natural Stone",
+    "Rb - Clay Masonry & Bricks",
+    "Ra - Bituminous / Asphalt",
+    "FL - Floating Material (Wood/Plastic)",
+    "X - Other Contaminants (Glass/Metal/Soil)"
+]
+
+CARBONATION_STATES = ["Uncarbonated", "Carbonated", "Non-cementitious"]
+LIBERATION_INDEXES = [
+    "I - Liberated",
+    "II - Partly locked",
+    "III - Fully locked",
+    "IV - Paste only"
+]
+
 DEFAULT_LOOKUPS = {
     "Aggregates": {
         "Phase1": "Quartz", "Phase2": "Plagioclase", "Phase3": "K-Feldspar", 
         "Phase4": "Feldspathoid", "Good_Agg": "Good Aggregate", "Bad_Agg": "Bad Aggregate",
         "Binder": "Cement Matrix", "NA": "NA"
+    },
+    "Aggregate - Recycled": {
+        "Phase1": "Concrete Particle", "Phase2": "Brick / Masonry", "Phase3": "Natural Quartz Aggregate", 
+        "Phase4": "Asphalt Fragment", "Phase5": "Hardened Cement Paste", "Good_Agg": "Clean Stone",
+        "Bad_Agg": "Contaminated Aggregate", "Binder": "Residual Paste", "NA": "NA"
     },
     "Concrete - I.S.465": {
         "Phase1": "Quartz", "Phase2": "Cement Paste", "Phase3": "Mica / Phlogopite", 
@@ -113,13 +135,11 @@ if uploaded_file is not None:
     col4.metric("Total Gross Points", len(df_raw))
 
     # ---------------------------------------------------------
-    # NEW MODULE: POINT COUNT GEOMETRY & TRAVERSE METRICS
+    # POINT COUNT GEOMETRY & TRAVERSE METRICS
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("📐 Point Count Geometry & Traverse Metrics")
-    st.caption(f"Calculated using spatial coordinates at a scale of **{SCALE_UM_PER_PX} μm/pixel**.")
 
-    # Convert coordinates to microns & mm
     df_raw["X_um"] = df_raw["X"] * SCALE_UM_PER_PX
     df_raw["Y_um"] = df_raw["Y"] * SCALE_UM_PER_PX
 
@@ -132,32 +152,27 @@ if uploaded_file is not None:
     height_mm = height_um / 1000.0
     area_mm2 = width_mm * height_mm
 
-    # Traverses (Unique Y rows) & Transects (Unique X columns)
     unique_y = np.sort(df_raw["Y_um"].unique())
     unique_x = np.sort(df_raw["X_um"].unique())
 
     num_traverses = len(unique_y)
     num_transects = len(unique_x)
 
-    # Spacing calculations
     x_spacing_um = np.mean(np.diff(unique_x)) if len(unique_x) > 1 else 0.0
     y_spacing_um = np.mean(np.diff(unique_y)) if len(unique_y) > 1 else 0.0
-
-    # Total Linear Traverse Distance = Number of Traverses * Row Width
     total_linear_traverse_mm = num_traverses * width_mm
 
-    # Display Metrics in Cards
     m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-    m_col1.metric("X-Span (Width)", f"{width_mm:.2f} mm", f"{width_um:.0f} μm")
-    m_col2.metric("Y-Span (Height)", f"{height_mm:.2f} mm", f"{height_um:.0f} μm")
-    m_col3.metric("Total Bounding Area", f"{area_mm2:.2f} mm²")
+    m_col1.metric("X-Span (Width)", f"{width_mm:.2f} mm")
+    m_col2.metric("Y-Span (Height)", f"{height_mm:.2f} mm")
+    m_col3.metric("Bounding Area", f"{area_mm2:.2f} mm²")
     m_col4.metric("Total Linear Traverse", f"{total_linear_traverse_mm:.2f} mm")
 
     m_col5, m_col6, m_col7, m_col8 = st.columns(4)
-    m_col5.metric("Number of Traverses (Rows)", num_traverses)
-    m_col6.metric("Number of Transects (Cols)", num_transects)
-    m_col7.metric("X-Spacing (Point Step)", f"{x_spacing_um:.1f} μm")
-    m_col8.metric("Y-Spacing (Row Step)", f"{y_spacing_um:.1f} μm")
+    m_col5.metric("Traverses (Rows)", num_traverses)
+    m_col6.metric("Transects (Cols)", num_transects)
+    m_col7.metric("X-Spacing", f"{x_spacing_um:.1f} μm")
+    m_col8.metric("Y-Spacing", f"{y_spacing_um:.1f} μm")
 
     # ---------------------------------------------------------
     # STEP 2: QUALITY CONTROL & TAXONOMY MAPPING
@@ -183,15 +198,44 @@ if uploaded_file is not None:
     df_mapped = df_raw.copy()
     df_mapped["Standardized_Phase"] = df_mapped["Raw_Term"].map(mapping_dict)
 
-    # Exclude NA
     df_valid = df_mapped[df_mapped["Standardized_Phase"].str.upper() != "NA"].copy()
     valid_points_count = len(df_valid)
     na_count = len(df_mapped) - valid_points_count
 
-    st.caption(f"ℹ️ **Exclusion Notice:** {na_count} 'NA' points excluded from statistical analysis. Valid count: {valid_points_count}.")
+    st.caption(f"ℹ️ **Exclusion Notice:** {na_count} 'NA' points excluded from modal calculations. Valid count: {valid_points_count}.")
 
     # ---------------------------------------------------------
-    # STEP 3: MODAL ANALYSIS & STATISTICAL INTERPRETATION
+    # SPECIAL MODULE: Aggregate - Recycled Tagging
+    # ---------------------------------------------------------
+    tagging_data = {}
+    if sample_type == "Aggregate - Recycled":
+        st.markdown("---")
+        st.subheader("🏷️ Step 2B: Recycled Aggregate Phase Tagging (EN 933-11)")
+        st.info("Assign classification tags to each identified phase before generating stacked reports.")
+
+        active_phases = df_valid["Standardized_Phase"].unique().tolist()
+        
+        for phase in active_phases:
+            st.write(f"##### Phase: **{phase}**")
+            t_col1, t_col2, t_col3 = st.columns(3)
+            
+            en_class = t_col1.selectbox(f"EN933-11 Class ({phase})", EN933_11_CLASSES, key=f"en_{phase}")
+            carb_state = t_col2.selectbox(f"Carbonation ({phase})", CARBONATION_STATES, key=f"carb_{phase}")
+            lib_idx = t_col3.selectbox(f"Liberation Index ({phase})", LIBERATION_INDEXES, key=f"lib_{phase}")
+            
+            tagging_data[phase] = {
+                "EN933_Class": en_class,
+                "Carbonation": carb_state,
+                "Liberation": lib_idx
+            }
+
+        # Apply tags to dataset
+        df_valid["EN933_Class"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["EN933_Class"])
+        df_valid["Carbonation"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["Carbonation"])
+        df_valid["Liberation"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["Liberation"])
+
+    # ---------------------------------------------------------
+    # STEP 3: MODAL ANALYSIS
     # ---------------------------------------------------------
     st.markdown("---")
     st.subheader("📊 Step 3: Modal Analysis Results")
@@ -202,7 +246,7 @@ if uploaded_file is not None:
     p = summary["Modal_Percent (%)"] / 100
     summary["Std_Error (%)"] = 2 * np.sqrt((p * (1 - p)) / valid_points_count) * 100
 
-    if sample_type in ["Aggregates", "Rock"]:
+    if sample_type in ["Aggregates", "Aggregate - Recycled", "Rock"]:
         summary["Abundance"] = summary["Modal_Percent (%)"].apply(classify_abundance)
 
     summary["Modal_Percent (%)"] = summary["Modal_Percent (%)"].round(2)
@@ -217,69 +261,48 @@ if uploaded_file is not None:
         st.write("##### Modal Composition")
         fig_bar = px.bar(
             summary, x="Standardized_Phase", y="Modal_Percent (%)", 
-            text="Modal_Percent (%)", color="Standardized_Phase",
-            labels={"Standardized_Phase": "Phase"}
+            text="Modal_Percent (%)", color="Standardized_Phase"
         )
         st.plotly_chart(fig_bar, use_container_width=True)
 
     # ---------------------------------------------------------
-    # SPECIAL MODULE: Concrete - I.S.465 Analysis
+    # SPECIAL MODULE: Recycled Aggregate 100% Stacked Bar Charts
     # ---------------------------------------------------------
-    if sample_type == "Concrete - I.S.465":
+    if sample_type == "Aggregate - Recycled":
         st.markdown("---")
-        st.subheader("🧱 Concrete - I.S.465 Aggregate Derivations")
-        
-        good_agg_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Good Aggregate", case=False), "Point_Count"].sum()
-        bad_agg_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Bad Aggregate", case=False), "Point_Count"].sum()
-        total_agg_cnt = good_agg_cnt + bad_agg_cnt
+        st.subheader("📈 Recycled Aggregate 100% Stacked Tag Plots")
 
-        if total_agg_cnt > 0:
-            total_agg_pct = (total_agg_cnt / valid_points_count) * 100
-            pct_good_of_agg = (good_agg_cnt / total_agg_cnt) * 100
-            pct_bad_of_agg = (bad_agg_cnt / total_agg_cnt) * 100
+        st_tab1, st_tab2, st_tab3 = st.tabs(["EN933-11 Classification", "Carbonation State", "Liberation Index"])
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Overall Aggregate Content", f"{total_agg_pct:.2f} %")
-            m2.metric("% Good Aggregate (of Total Agg)", f"{pct_good_of_agg:.2f} %")
-            m3.metric("% Bad Aggregate (of Total Agg)", f"{pct_bad_of_agg:.2f} %")
-        else:
-            st.warning("No points classified as 'Good Aggregate' or 'Bad Aggregate' were found in the current mapping.")
+        with st_tab1:
+            df_en = df_valid.groupby(["Standardized_Phase", "EN933_Class"]).size().reset_index(name="Count")
+            fig_en = px.bar(
+                df_en, x="Standardized_Phase", y="Count", color="EN933_Class",
+                title="100% Stacked Chart: EN933-11 Class by Phase",
+                groupnorm="fraction"
+            )
+            fig_en.update_layout(yaxis=dict(tickformat=".0%"))
+            st.plotly_chart(fig_en, use_container_width=True)
 
-    # ---------------------------------------------------------
-    # SPECIAL MODULE: QAPF Ternary Plot
-    # ---------------------------------------------------------
-    if sample_type in ["Rock", "Aggregates"]:
-        st.markdown("---")
-        st.subheader("🔺 QAPF Ternary Classification")
-        
-        q_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Quartz", case=False), "Point_Count"].sum()
-        a_cnt = summary.loc[summary["Standardized_Phase"].str.contains("K-Feldspar|Alkali", case=False), "Point_Count"].sum()
-        p_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Plagioclase", case=False), "Point_Count"].sum()
-        
-        qap_sum = q_cnt + a_cnt + p_cnt
-        if qap_sum > 0:
-            norm_q = (q_cnt / qap_sum) * 100
-            norm_a = (a_cnt / qap_sum) * 100
-            norm_p = (p_cnt / qap_sum) * 100
+        with st_tab2:
+            df_carb = df_valid.groupby(["Standardized_Phase", "Carbonation"]).size().reset_index(name="Count")
+            fig_carb = px.bar(
+                df_carb, x="Standardized_Phase", y="Count", color="Carbonation",
+                title="100% Stacked Chart: Carbonation State by Phase",
+                groupnorm="fraction"
+            )
+            fig_carb.update_layout(yaxis=dict(tickformat=".0%"))
+            st.plotly_chart(fig_carb, use_container_width=True)
 
-            fig_ternary = go.Figure(go.Scatterternary({
-                'mode': 'markers',
-                'a': [norm_q],
-                'b': [norm_a],
-                'c': [norm_p],
-                'text': [f"Sample: {sample_id}"],
-                'marker': {'symbol': 'circle', 'size': 14, 'color': 'red'}
-            }))
-            fig_ternary.update_layout({
-                'ternary': {
-                    'sum': 100,
-                    'aaxis': {'title': 'Quartz (Q)'},
-                    'baxis': {'title': 'Alkali Feldspar (A)'},
-                    'caxis': {'title': 'Plagioclase (P)'}
-                },
-                'title': 'Q-A-P Ternary Plot'
-            })
-            st.plotly_chart(fig_ternary, use_container_width=True)
+        with st_tab3:
+            df_lib = df_valid.groupby(["Standardized_Phase", "Liberation"]).size().reset_index(name="Count")
+            fig_lib = px.bar(
+                df_lib, x="Standardized_Phase", y="Count", color="Liberation",
+                title="100% Stacked Chart: Liberation Index by Phase",
+                groupnorm="fraction"
+            )
+            fig_lib.update_layout(yaxis=dict(tickformat=".0%"))
+            st.plotly_chart(fig_lib, use_container_width=True)
 
     # ---------------------------------------------------------
     # STEP 4: SPATIAL DISTRIBUTION & NEAREST NEIGHBOR INDEX
@@ -292,8 +315,7 @@ if uploaded_file is not None:
     with c_map:
         fig_scatter = px.scatter(
             df_valid, x="X_um", y="Y_um", color="Standardized_Phase",
-            title="Spatial Point Distribution Across Thin Section (μm)",
-            labels={"X_um": "X Position (μm)", "Y_um": "Y Position (μm)"}
+            title="Spatial Point Distribution Across Thin Section (μm)"
         )
         fig_scatter.update_yaxes(autorange="reversed")
         st.plotly_chart(fig_scatter, use_container_width=True)
@@ -319,7 +341,7 @@ if uploaded_file is not None:
     col_dl.download_button(
         label="📥 Download Interpreted Modal Report (CSV)",
         data=csv_data,
-        file_name=f"{job_number}_{sample_id}_modal_report.csv",
+        file_name=f"{job_number}_{sample_id}_recycled_agg_report.csv",
         mime="text/csv"
     )
 else:
