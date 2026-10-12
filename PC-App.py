@@ -23,19 +23,27 @@ DEFAULT_LOOKUPS = {
         "Phase9": "Gypsum",
         "Good_Agg": "Sound Aggregate",
         "Bad_Agg": "Reactive Aggregate",
-        "NA": "Unidentified / Void"
+        "NA": "NA"
     },
-    "Sandstone / Petrography": {
-        "Phase1": "Monocrystalline Quartz",
-        "Phase2": "Polycrystalline Quartz",
-        "Phase3": "K-Feldspar",
-        "Phase4": "Plagioclase",
-        "Phase5": "Rock Fragment (Lithic)",
-        "Phase6": "Mica",
-        "Phase7": "Matrix / Clay",
-        "Phase8": "Cement (Calcite)",
-        "Phase9": "Porosity",
-        "NA": "Unidentified"
+    "Aggregate Petrography": {
+        "Phase1": "Quartz",
+        "Phase2": "Quartzite",
+        "Phase3": "Chert",
+        "Phase4": "Plagioclase Feldspar",
+        "Phase5": "Alkali Feldspar",
+        "Phase6": "Muscovite Mica",
+        "Phase7": "Iron oxides",
+        "Phase8": "Calcite",
+        "Phase9": "Granite",
+        "NA": "NA"
+    },
+    "Concrete - 1000pts": {
+        "Coarse_Agg": "Coarse Aggregate",
+        "Fine_Agg": "Fine aggregate",
+        "Binder": "Binder",
+        "Void": "Void",
+        "Fracture", "Fractures"
+        "NA", "NA"
     }
 }
 
