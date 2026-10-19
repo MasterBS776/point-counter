@@ -102,16 +102,16 @@ def save_sample_to_db(sample_meta, df_summary):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             sample_meta["sample_id"],
-            row.get("Standardized_Phase", ""),
-            int(row.get("Point_Count", 0)),
-            float(row.get("Modal_Percent (%)", 0.0)),
-            float(row.get("Std_Error (%)", 0.0)),
-            row.get("Abundance", None),
-            float(row.get("Density (g/cm³)", 2.65)) if pd.notnull(row.get("Density (g/cm³)")) else None,
-            float(row.get("Weight_Percent (%)", 0.0)) if pd.notnull(row.get("Weight_Percent (%)")) else None,
-            row.get("EN933_Class", None),
-            row.get("Carbonation", None),
-            row.get("Liberation", None)
+            row.get("Standardized_Phase", row.get("phase_name", "")),
+            int(row.get("Point_Count", row.get("point_count", 0))),
+            float(row.get("Modal_Percent (%)", row.get("modal_percent", 0.0))),
+            float(row.get("Std_Error (%)", row.get("std_error", 0.0))),
+            row.get("Abundance", row.get("abundance", None)),
+            float(row.get("Density (g/cm³)", row.get("density_gcm3", 2.65))) if pd.notnull(row.get("Density (g/cm³)", row.get("density_gcm3", None))) else None,
+            float(row.get("Weight_Percent (%)", row.get("wt_percent", 0.0))) if pd.notnull(row.get("Weight_Percent (%)", row.get("wt_percent", None))) else None,
+            row.get("EN933_Class", row.get("en933_class", None)),
+            row.get("Carbonation", row.get("carbonation", None)),
+            row.get("Liberation", row.get("liberation", None))
         ))
         
     conn.commit()
@@ -215,8 +215,8 @@ def evaluate_asr_risk(df_summary):
     norm_pct = 0.0
     
     for _, row in df_summary.iterrows():
-        p_name = str(row["Standardized_Phase"]).lower()
-        pct = row["Modal_Percent (%)"]
+        p_name = str(row.get("Standardized_Phase", row.get("phase_name", ""))).lower()
+        pct = float(row.get("Modal_Percent (%)", row.get("modal_percent", 0.0)))
         if any(h in p_name for h in high_react):
             high_pct += pct
         elif any(n in p_name for n in norm_react):
@@ -264,8 +264,9 @@ def calculate_spatial_index(df_points):
 # ---------------------------------------------------------
 # MAIN TAB NAVIGATION
 # ---------------------------------------------------------
-main_tab1, main_tab2, main_tab3, main_tab4, main_tab5 = st.tabs([
+main_tab1, main_tab2, main_tab3, main_tab4, main_tab5, main_tab6 = st.tabs([
     "🔬 Sample Point Count Analysis", 
+    "⚖️ Aggregate Density & DB Editor",
     "🏗️ Concrete Mix Design (DB)", 
     "📊 Multi-Sample Comparison", 
     "🌐 Geological Drive Resources",
@@ -456,49 +457,6 @@ with main_tab1:
                 })
                 st.plotly_chart(fig_ternary, use_container_width=True)
 
-        # EN 933-11 Stacked Bar Charts (Recycled Aggregate)
-        if sample_type == "Aggregate - Recycled" and "EN933_Class" in df_valid.columns:
-            st.markdown("---")
-            st.subheader("📈 Recycled Aggregate 100% Stacked Tag Plots")
-
-            st_tab1, st_tab2, st_tab3 = st.tabs(["EN933-11 Classification", "Carbonation State", "Liberation Index"])
-
-            with st_tab1:
-                df_en = df_valid.groupby(["Standardized_Phase", "EN933_Class"]).size().reset_index(name="Count")
-                phase_totals = df_en.groupby("Standardized_Phase")["Count"].transform("sum")
-                df_en["Percentage"] = (df_en["Count"] / phase_totals) * 100
-                
-                fig_en = px.bar(
-                    df_en, x="Standardized_Phase", y="Percentage", color="EN933_Class",
-                    title="100% Stacked Chart: EN933-11 Class by Phase", barmode="stack"
-                )
-                fig_en.update_layout(yaxis=dict(ticksuffix="%"))
-                st.plotly_chart(fig_en, use_container_width=True)
-
-            with st_tab2:
-                df_carb = df_valid.groupby(["Standardized_Phase", "Carbonation"]).size().reset_index(name="Count")
-                phase_totals_c = df_carb.groupby("Standardized_Phase")["Count"].transform("sum")
-                df_carb["Percentage"] = (df_carb["Count"] / phase_totals_c) * 100
-                
-                fig_carb = px.bar(
-                    df_carb, x="Standardized_Phase", y="Percentage", color="Carbonation",
-                    title="100% Stacked Chart: Carbonation State by Phase", barmode="stack"
-                )
-                fig_carb.update_layout(yaxis=dict(ticksuffix="%"))
-                st.plotly_chart(fig_carb, use_container_width=True)
-
-            with st_tab3:
-                df_lib = df_valid.groupby(["Standardized_Phase", "Liberation"]).size().reset_index(name="Count")
-                phase_totals_l = df_lib.groupby("Standardized_Phase")["Count"].transform("sum")
-                df_lib["Percentage"] = (df_lib["Count"] / phase_totals_l) * 100
-                
-                fig_lib = px.bar(
-                    df_lib, x="Standardized_Phase", y="Percentage", color="Liberation",
-                    title="100% Stacked Chart: Liberation Index by Phase", barmode="stack"
-                )
-                fig_lib.update_layout(yaxis=dict(ticksuffix="%"))
-                st.plotly_chart(fig_lib, use_container_width=True)
-
         # Concrete I.S. 465 Aggregate Derivations
         if sample_type == "Concrete - I.S.465":
             st.markdown("---")
@@ -611,9 +569,84 @@ with main_tab1:
         st.info("👈 Please upload a point count CSV/TSV file from the sidebar to begin analysis.")
 
 # =========================================================
-# TAB 2: CONCRETE MIX DESIGN PLACEHOLDER
+# TAB 2: AGGREGATE DENSITY & DB RE-EVALUATION EDITOR
 # =========================================================
 with main_tab2:
+    st.header("⚖️ Database Aggregate Density & wt% Editor")
+    st.info("Load any previously saved sample from the database to inspect, reassign density values (g/cm³), and update weight percentages (wt%).")
+
+    df_db_samples = load_all_samples()
+    if not df_db_samples.empty:
+        selected_db_id = st.selectbox("Select Saved Sample to Edit/Re-evaluate", df_db_samples["sample_id"].unique(), key="db_edit_sel")
+        
+        if selected_db_id:
+            sample_row = df_db_samples[df_db_samples["sample_id"] == selected_db_id].iloc[0]
+            df_details = load_sample_details(selected_db_id)
+            
+            st.markdown("---")
+            st.write(f"##### Selected Sample: **{selected_db_id}** | Job: **{sample_row['job_number']}** | Type: **{sample_row['sample_type']}**")
+
+            st.write("Reassign densities (g/cm³) for each phase:")
+            edited_densities = []
+            
+            ed_cols = st.columns(len(df_details))
+            for idx, r in df_details.iterrows():
+                p_name = r["phase_name"]
+                cur_d = r["density_gcm3"] if pd.notnull(r["density_gcm3"]) else DEFAULT_DENSITIES.get(p_name, 2.65)
+                with ed_cols[idx % len(ed_cols)]:
+                    new_d = st.number_input(f"Density: {p_name}", value=float(cur_d), step=0.05, key=f"db_d_{selected_db_id}_{p_name}")
+                    edited_densities.append(new_d)
+                    
+            df_details["density_gcm3"] = edited_densities
+            mass_f = df_details["modal_percent"] * df_details["density_gcm3"]
+            df_details["wt_percent"] = (mass_f / mass_f.sum()) * 100
+            df_details["wt_percent"] = df_details["wt_percent"].round(2)
+            
+            st.write("##### Updated Modal & Weight Percentage Table")
+            st.dataframe(df_details[["phase_name", "point_count", "modal_percent", "density_gcm3", "wt_percent", "abundance"]], use_container_width=True)
+
+            # Re-evaluate BS 8500 ASR Risk
+            df_details_eval = df_details.rename(columns={"phase_name": "Standardized_Phase", "modal_percent": "Modal_Percent (%)"})
+            re_asr_risk, re_asr_desc = evaluate_asr_risk(df_details_eval)
+            st.metric("Re-evaluated BS 8500-2 Annex C ASR Risk", re_asr_risk)
+            st.info(re_asr_desc)
+
+            if st.button("💾 Overwrite & Save Updated Densities to DB", type="primary"):
+                meta_update = {
+                    "sample_id": sample_row["sample_id"],
+                    "job_number": sample_row["job_number"],
+                    "sample_order": sample_row["sample_order"],
+                    "sample_type": sample_row["sample_type"],
+                    "operator": sample_row["operator"],
+                    "total_points": sample_row["total_points"],
+                    "valid_points": sample_row["valid_points"],
+                    "area_mm2": sample_row["bounding_area_mm2"],
+                    "linear_traverse_mm": sample_row["linear_traverse_mm"],
+                    "lithology_code": sample_row.get("lithology_code", "")
+                }
+                
+                df_details.rename(columns={
+                    "phase_name": "Standardized_Phase",
+                    "point_count": "Point_Count",
+                    "modal_percent": "Modal_Percent (%)",
+                    "std_error": "Std_Error (%)",
+                    "abundance": "Abundance",
+                    "density_gcm3": "Density (g/cm³)",
+                    "wt_percent": "Weight_Percent (%)",
+                    "en933_class": "EN933_Class",
+                    "carbonation": "Carbonation",
+                    "liberation": "Liberation"
+                }, inplace=True)
+                
+                save_sample_to_db(meta_update, df_details)
+                st.success(f"Sample '{selected_db_id}' updated in database with new density & wt% calculations!")
+    else:
+        st.info("No saved samples available in the database to edit yet.")
+
+# =========================================================
+# TAB 3: CONCRETE MIX DESIGN PLACEHOLDER
+# =========================================================
+with main_tab3:
     st.header("🏗️ Concrete Mix Design Calculation Engine")
     st.info("Load saved concrete thin section point count data from the database to derive paste/aggregate ratios and mix parameters.")
     
@@ -630,9 +663,9 @@ with main_tab2:
         st.info("No saved database samples available.")
 
 # =========================================================
-# TAB 3: MULTI-SAMPLE COMPARISON PLACEHOLDER
+# TAB 4: MULTI-SAMPLE COMPARISON PLACEHOLDER
 # =========================================================
-with main_tab3:
+with main_tab4:
     st.header("📊 Multi-Sample Comparative Analysis Dashboard")
     st.info("Compare petrographic results across multiple samples of the same sample type.")
     
@@ -647,9 +680,9 @@ with main_tab3:
         st.info("No saved database samples available.")
 
 # =========================================================
-# TAB 4: GEOLOGICAL DRIVE RESOURCES PLACEHOLDER
+# TAB 5: GEOLOGICAL DRIVE RESOURCES PLACEHOLDER
 # =========================================================
-with main_tab4:
+with main_tab5:
     st.header("🌐 Geological Google Drive Resources")
     st.info("Connect to Google Drive hosted geological manuals, thin section reference atlases, and standards.")
     
@@ -658,9 +691,9 @@ with main_tab4:
     st.caption("⚙️ PDF reference viewer and aggregate lithology optical reference photos will load here.")
 
 # =========================================================
-# TAB 5: LOCAL DATABASE BROWSER
+# TAB 6: LOCAL DATABASE BROWSER
 # =========================================================
-with main_tab5:
+with main_tab6:
     st.subheader("📁 Saved Geological Samples History")
     df_history = load_all_samples()
     
