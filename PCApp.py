@@ -341,7 +341,5 @@ with main_tab1:
         m_col5.metric("Traverses (Rows)", num_traverses)
         m_col6.metric("Transects (Cols)", num_transects)
         m_col7.metric("X-Spacing", f"{x_spacing_um:.1f} μm")
-        m_col8.metric("Y-Spacing", f"{y_spacing_um:.1f} μm")
-
-        st.markdown("---")
-        st.subheader("🛠️ Step 2: Quality
+        m_col8.metric
+    
