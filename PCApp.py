@@ -4,22 +4,19 @@ import numpy as np
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from scipy.spatial import distance_matrix
+from scipy.spatial.distance import cdist  # Replaces distance_matrix to fix deprecation warning
 
-st.set_page_config(page_title="Geological Petrography QC & Analysis", layout="wide")
-
-st.title("🔬 Geological Petrography Analysis Platform")
-
-SCALE_UM_PER_PX = 1.82  # 1.82 microns per pixel
+SCALE_UM_PER_PX = 1.82
 DB_FILE = "petrography_data.db"
 
 # ---------------------------------------------------------
-# 0. DATABASE PERSISTENCE MODULE (SQLITE)
+# DATABASE PERSISTENCE & AUTOMATIC SCHEMA MIGRATION
 # ---------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
+    # 1. Base Samples Master Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS samples (
             sample_id TEXT PRIMARY KEY,
@@ -31,11 +28,19 @@ def init_db():
             valid_points INTEGER,
             bounding_area_mm2 REAL,
             linear_traverse_mm REAL,
-            lithology_code TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     
+    # AUTOMATIC MIGRATION: Check if lithology_code column exists, add it if missing
+    try:
+        cursor.execute("ALTER TABLE samples ADD COLUMN lithology_code TEXT;")
+        conn.commit()
+    except sqlite3.OperationalError:
+        # Column already exists
+        pass
+    
+    # 2. Modal Results Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS modal_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,6 +60,45 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+
+init_db()
+
+# ---------------------------------------------------------
+# SPATIAL INDEX (FIXED SCIPY DISTANCE FUNCTION)
+# ---------------------------------------------------------
+def calculate_spatial_index(df_points):
+    if len(df_points) < 5:
+        return None, "Insufficient points"
+    
+    coords = df_points[["X", "Y"]].values
+    
+    # Uses cdist instead of distance_matrix to avoid SciPy deprecation warnings
+    dist_mat = cdist(coords, coords, metric='euclidean')
+    np.fill_diagonal(dist_mat, np.inf)
+    
+    nearest_dists = np.min(dist_mat, axis=1)
+    mean_observed_dist = np.mean(nearest_dists)
+    
+    x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
+    y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
+    area = (x_max - x_min) * (y_max - y_min)
+    
+    if area == 0:
+        return None, "Zero Area"
+    
+    density = len(coords) / area
+    mean_expected_dist = 0.5 / np.sqrt(density)
+    
+    R = mean_observed_dist / mean_expected_dist
+    
+    if R < 0.95:
+        desc = "Clustered / Segregated"
+    elif 0.95 <= R <= 1.05:
+        desc = "Randomly Distributed"
+    else:
+        desc = "Uniformly / Regularly Distributed"
+        
+    return R, desc
 
 init_db()
 
