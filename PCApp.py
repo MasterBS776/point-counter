@@ -4,7 +4,7 @@ import numpy as np
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from scipy.spatial.distance import cdist  # Replaces distance_matrix to resolve NameError and SciPy deprecation warnings
+from scipy.spatial.distance import cdist  # Replaces distance_matrix to avoid SciPy deprecation warnings
 
 st.set_page_config(page_title="Geological Petrography QC & Analysis", layout="wide")
 
@@ -14,12 +14,13 @@ SCALE_UM_PER_PX = 1.82  # 1.82 microns per pixel
 DB_FILE = "petrography_data.db"
 
 # ---------------------------------------------------------
-# 0. DATABASE PERSISTENCE & AUTOMATIC SCHEMA MIGRATION
+# 0. DATABASE PERSISTENCE & AUTO-MIGRATION MODULE
 # ---------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
+    # 1. Base Samples Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS samples (
             sample_id TEXT PRIMARY KEY,
@@ -35,13 +36,14 @@ def init_db():
         )
     """)
     
-    # Schema Migration: Safely add lithology_code if it does not exist
+    # Auto-migrate 'samples' table if missing 'lithology_code'
     try:
         cursor.execute("ALTER TABLE samples ADD COLUMN lithology_code TEXT;")
         conn.commit()
     except sqlite3.OperationalError:
-        pass  # Column already exists
-    
+        pass
+
+    # 2. Base Modal Results Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS modal_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,14 +53,26 @@ def init_db():
             modal_percent REAL,
             std_error REAL,
             abundance TEXT,
-            density_gcm3 REAL,
-            wt_percent REAL,
             en933_class TEXT,
             carbonation TEXT,
             liberation TEXT,
             FOREIGN KEY(sample_id) REFERENCES samples(sample_id)
         )
     """)
+    
+    # Auto-migrate 'modal_results' table if missing density columns
+    try:
+        cursor.execute("ALTER TABLE modal_results ADD COLUMN density_gcm3 REAL;")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE modal_results ADD COLUMN wt_percent REAL;")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -220,8 +234,6 @@ def calculate_spatial_index(df_points):
         return None, "Insufficient points"
     
     coords = df_points[["X", "Y"]].values
-    
-    # Uses scipy.spatial.distance.cdist to resolve NameError and deprecation warnings
     dist_mat = cdist(coords, coords, metric='euclidean')
     np.fill_diagonal(dist_mat, np.inf)
     
@@ -400,7 +412,7 @@ with main_tab1:
         col_tbl, col_chart = st.columns([1.2, 1])
         with col_tbl:
             st.write("##### Phase Modal Percentage Table")
-            st.dataframe(summary, use_container_width=True)
+            st.dataframe(summary, width="stretch")
 
         with col_chart:
             st.write("##### Modal Composition")
@@ -408,7 +420,7 @@ with main_tab1:
                 summary, x="Standardized_Phase", y="Modal_Percent (%)", 
                 text="Modal_Percent (%)", color="Standardized_Phase"
             )
-            st.plotly_chart(fig_bar, use_container_width=True)
+            st.plotly_chart(fig_bar, width="stretch")
 
         # Concrete I.S. 465 Aggregate Derivations
         if sample_type == "Concrete - I.S.465":
@@ -455,7 +467,7 @@ with main_tab1:
                 summary["Weight_Percent (%)"] = (mass_factor / mass_factor.sum()) * 100
                 summary["Weight_Percent (%)"] = summary["Weight_Percent (%)"].round(2)
 
-                st.dataframe(summary[["Standardized_Phase", "Point_Count", "Modal_Percent (%)", "Density (g/cm³)", "Weight_Percent (%)"]], use_container_width=True)
+                st.dataframe(summary[["Standardized_Phase", "Point_Count", "Modal_Percent (%)", "Density (g/cm³)", "Weight_Percent (%)"]], width="stretch")
 
             with agg_tab2:
                 asr_risk, asr_desc = evaluate_asr_risk(summary)
@@ -473,7 +485,7 @@ with main_tab1:
                 title="Spatial Point Distribution Across Thin Section (μm)"
             )
             fig_scatter.update_yaxes(autorange="reversed")
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            st.plotly_chart(fig_scatter, width="stretch")
 
         with c_index:
             st.write("##### Spatial Dispersion Coefficient")
@@ -486,101 +498,3 @@ with main_tab1:
         st.subheader("💾 Step 5: Save & Export")
         
         col_save, col_dl = st.columns(2)
-        
-        if col_save.button("✅ Confirm QC & Save to Local Database", type="primary"):
-            meta_payload = {
-                "sample_id": sample_id,
-                "job_number": job_number,
-                "sample_order": sample_order,
-                "sample_type": sample_type,
-                "operator": operator,
-                "total_points": len(df_raw),
-                "valid_points": valid_points_count,
-                "area_mm2": area_mm2,
-                "linear_traverse_mm": total_linear_traverse_mm,
-                "lithology_code": litho_tag
-            }
-            
-            if sample_type == "Aggregate - Recycled":
-                summary = summary.merge(
-                    df_valid[["Standardized_Phase", "EN933_Class", "Carbonation", "Liberation"]].drop_duplicates(),
-                    on="Standardized_Phase", how="left"
-                )
-                
-            save_sample_to_db(meta_payload, summary)
-            st.success(f"Sample '{sample_id}' saved to local database!")
-
-        csv_data = summary.to_csv(index=False).encode('utf-8')
-        col_dl.download_button(
-            label="📥 Download Interpreted Modal Report (CSV)",
-            data=csv_data,
-            file_name=f"{job_number}_{sample_id}_modal_report.csv",
-            mime="text/csv"
-        )
-    else:
-        st.info("👈 Please upload a point count CSV/TSV file from the sidebar to begin.")
-
-# =========================================================
-# TAB 2: CONCRETE MIX DESIGN PLACEHOLDER
-# =========================================================
-with main_tab2:
-    st.header("🏗️ Concrete Mix Design Calculation Engine")
-    st.info("Load saved concrete thin section point count data from the database to derive paste/aggregate ratios and mix parameters.")
-    
-    df_samples = load_all_samples()
-    if not df_samples.empty:
-        conc_samples = df_samples[df_samples["sample_type"].str.contains("Concrete", case=False)]
-        if not conc_samples.empty:
-            sel_conc = st.selectbox("Select Concrete Sample from Database", conc_samples["sample_id"].unique())
-            st.write(f"Loaded Concrete Sample: **{sel_conc}**")
-            st.caption("⚙️ Concrete mix proportioning calculations (Paste %, Aggregate %, Air Content %, estimated W/C ratio) will render here.")
-        else:
-            st.warning("No Concrete samples found in the database yet.")
-    else:
-        st.info("No saved database samples available.")
-
-# =========================================================
-# TAB 3: MULTI-SAMPLE COMPARISON PLACEHOLDER
-# =========================================================
-with main_tab3:
-    st.header("📊 Multi-Sample Comparative Analysis Dashboard")
-    st.info("Compare petrographic results across multiple samples of the same sample type.")
-    
-    df_samples = load_all_samples()
-    if not df_samples.empty:
-        comp_type = st.selectbox("Select Sample Type to Compare", df_samples["sample_type"].unique())
-        filtered_s = df_samples[df_samples["sample_type"] == comp_type]
-        st.write(f"Found **{len(filtered_s)}** samples for type: **{comp_type}**")
-        st.dataframe(filtered_s, use_container_width=True)
-        st.caption("⚙️ Multi-sample trend plots, ternary compilation diagrams, and aggregate variability tables will render here.")
-    else:
-        st.info("No saved database samples available.")
-
-# =========================================================
-# TAB 4: GEOLOGICAL DRIVE RESOURCES PLACEHOLDER
-# =========================================================
-with main_tab4:
-    st.header("🌐 Geological Google Drive Resources")
-    st.info("Connect to Google Drive hosted geological manuals, thin section reference atlases, and standards.")
-    
-    st.text_input("Google Drive Folder ID / Share Link", value="https://drive.google.com/drive/folders/placeholder")
-    st.button("🔗 Connect to Google Workspace Drive")
-    st.caption("⚙️ PDF reference viewer and aggregate lithology optical reference photos will load here.")
-
-# =========================================================
-# TAB 5: LOCAL DATABASE BROWSER
-# =========================================================
-with main_tab5:
-    st.subheader("📁 Saved Geological Samples History")
-    df_history = load_all_samples()
-    
-    if not df_history.empty:
-        st.dataframe(df_history, use_container_width=True)
-        
-        selected_sample = st.selectbox("Select Sample to View Modal Breakdown", df_history["sample_id"].unique())
-        if selected_sample:
-            df_modal_history = load_sample_details(selected_sample)
-            st.write(f"##### Modal Breakdown for: **{selected_sample}**")
-            st.dataframe(df_modal_history, use_container_width=True)
-    else:
-        st.info("No saved samples found in the local database yet.")
