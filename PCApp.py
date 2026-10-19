@@ -17,7 +17,6 @@ DB_FILE = "petrography_data.db"
 # 0. DATABASE PERSISTENCE MODULE (SQLITE)
 # ---------------------------------------------------------
 def init_db():
-    """Initialize local SQLite database tables if they do not exist."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
@@ -32,6 +31,7 @@ def init_db():
             valid_points INTEGER,
             bounding_area_mm2 REAL,
             linear_traverse_mm REAL,
+            lithology_code TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -45,6 +45,8 @@ def init_db():
             modal_percent REAL,
             std_error REAL,
             abundance TEXT,
+            density_gcm3 REAL,
+            wt_percent REAL,
             en933_class TEXT,
             carbonation TEXT,
             liberation TEXT,
@@ -57,18 +59,18 @@ def init_db():
 init_db()
 
 def save_sample_to_db(sample_meta, df_summary):
-    """Save sample metadata and modal results to local SQLite DB."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
     cursor.execute("""
         INSERT OR REPLACE INTO samples 
-        (sample_id, job_number, sample_order, sample_type, operator, total_points, valid_points, bounding_area_mm2, linear_traverse_mm)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (sample_id, job_number, sample_order, sample_type, operator, total_points, valid_points, bounding_area_mm2, linear_traverse_mm, lithology_code)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         sample_meta["sample_id"], sample_meta["job_number"], sample_meta["sample_order"],
         sample_meta["sample_type"], sample_meta["operator"], sample_meta["total_points"],
-        sample_meta["valid_points"], sample_meta["area_mm2"], sample_meta["linear_traverse_mm"]
+        sample_meta["valid_points"], sample_meta["area_mm2"], sample_meta["linear_traverse_mm"],
+        sample_meta.get("lithology_code", "")
     ))
     
     cursor.execute("DELETE FROM modal_results WHERE sample_id = ?", (sample_meta["sample_id"],))
@@ -76,8 +78,8 @@ def save_sample_to_db(sample_meta, df_summary):
     for _, row in df_summary.iterrows():
         cursor.execute("""
             INSERT INTO modal_results 
-            (sample_id, phase_name, point_count, modal_percent, std_error, abundance, en933_class, carbonation, liberation)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (sample_id, phase_name, point_count, modal_percent, std_error, abundance, density_gcm3, wt_percent, en933_class, carbonation, liberation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             sample_meta["sample_id"],
             row.get("Standardized_Phase", ""),
@@ -85,6 +87,8 @@ def save_sample_to_db(sample_meta, df_summary):
             float(row.get("Modal_Percent (%)", 0.0)),
             float(row.get("Std_Error (%)", 0.0)),
             row.get("Abundance", None),
+            float(row.get("Density (g/cm³)", 2.65)) if pd.notnull(row.get("Density (g/cm³)")) else None,
+            float(row.get("Weight_Percent (%)", 0.0)) if pd.notnull(row.get("Weight_Percent (%)")) else None,
             row.get("EN933_Class", None),
             row.get("Carbonation", None),
             row.get("Liberation", None)
@@ -106,7 +110,7 @@ def load_sample_details(sample_id):
     return df_results
 
 # ---------------------------------------------------------
-# 1. SAMPLE TYPES & LOOKUPS
+# 1. SAMPLE TYPES, TAXONOMY & CODES
 # ---------------------------------------------------------
 SAMPLE_TYPES = [
     "Aggregates",
@@ -116,6 +120,22 @@ SAMPLE_TYPES = [
     "Rock",
     "Concrete - Block/Precast",
     "Render/Mortar"
+]
+
+# Paper doi.org/10.1016/j.conbuildmat.2023.133404 3-letter codes
+IS465_LITHOLOGY_CODES = [
+    "MCM - Muscovite Mica",
+    "MCP - Phlogopite Mica",
+    "QTZ - Quartzite / Quartz",
+    "CAL - Calcite / Limestone",
+    "PIR - Pyrite",
+    "PYR - Pyrrhotite",
+    "SIL - Siltstone",
+    "SND - Sandstone",
+    "GRE - Greywacke",
+    "SCH - Schist",
+    "DOL - Dolomite",
+    "FEL - Feldspar Matrix"
 ]
 
 EN933_11_CLASSES = [
@@ -128,12 +148,7 @@ EN933_11_CLASSES = [
 ]
 
 CARBONATION_STATES = ["Uncarbonated", "Carbonated", "Non-cementitious"]
-LIBERATION_INDEXES = [
-    "I - Liberated",
-    "II - Partly locked",
-    "III - Fully locked",
-    "IV - Paste only"
-]
+LIBERATION_INDEXES = ["I - Liberated", "II - Partly locked", "III - Fully locked", "IV - Paste only"]
 
 DEFAULT_LOOKUPS = {
     "Aggregates": {
@@ -157,6 +172,12 @@ DEFAULT_LOOKUPS = {
     }
 }
 
+DEFAULT_DENSITIES = {
+    "Quartz": 2.65, "Plagioclase": 2.68, "K-Feldspar": 2.56, "Feldspathoid": 2.45,
+    "Biotite": 3.09, "Muscovite": 2.82, "Calcite": 2.71, "Pyrite": 5.01,
+    "Pyrrhotite": 4.61, "Cement Paste": 2.10, "Good Aggregate": 2.65, "Bad Aggregate": 2.50
+}
+
 def classify_abundance(pct):
     if pct > 50.0:
         return "Major+"
@@ -166,6 +187,29 @@ def classify_abundance(pct):
         return "Minor"
     else:
         return "Trace"
+
+def evaluate_asr_risk(df_summary):
+    """BS 8500-2 Annex C ASR Risk Assessor."""
+    high_react = ["opal", "chalcedony", "chert", "flint", "volcanic glass", "strained quartz"]
+    norm_react = ["sandstone", "greywacke", "siltstone", "microcrystalline quartz"]
+    
+    high_pct = 0.0
+    norm_pct = 0.0
+    
+    for _, row in df_summary.iterrows():
+        p_name = str(row["Standardized_Phase"]).lower()
+        pct = row["Modal_Percent (%)"]
+        if any(h in p_name for h in high_react):
+            high_pct += pct
+        elif any(n in p_name for n in norm_react):
+            norm_pct += pct
+            
+    if high_pct > 5.0:
+        return "HIGH RISK", "🔴 Contains > 5% highly reactive silica constituents (BS 8500-2 Annex C)."
+    elif norm_pct > 10.0 or high_pct > 0.0:
+        return "MEDIUM / NORMAL RISK", "🟡 Contains normal reactivity aggregates. Apply standard concrete alkali limits."
+    else:
+        return "LOW RISK", "🟢 Predominantly low-reactivity minerals (Quartz/Feldspar/Carbonates)."
 
 def calculate_spatial_index(df_points):
     if len(df_points) < 5:
@@ -202,8 +246,17 @@ def calculate_spatial_index(df_points):
 # ---------------------------------------------------------
 # MAIN TAB NAVIGATION
 # ---------------------------------------------------------
-main_tab1, main_tab2 = st.tabs(["🔬 Current Sample Analysis", "📁 Local Database Browser"])
+main_tab1, main_tab2, main_tab3, main_tab4, main_tab5 = st.tabs([
+    "🔬 Sample Point Count Analysis", 
+    "🏗️ Concrete Mix Design (DB)", 
+    "📊 Multi-Sample Comparison", 
+    "🌐 Geological Drive Resources",
+    "📁 Local Database Browser"
+])
 
+# =========================================================
+# TAB 1: CURRENT SAMPLE ANALYSIS
+# =========================================================
 with main_tab1:
     st.sidebar.header("1. Upload & Job Metadata")
     uploaded_file = st.sidebar.file_uploader("Upload Point Count File (CSV/TSV)", type=["txt", "tsv", "csv"])
@@ -230,6 +283,11 @@ with main_tab1:
         col2.metric("Job Number", job_number)
         col3.metric("Sample Order", sample_order)
         col4.metric("Total Gross Points", len(df_raw))
+
+        # I.S. 465 Lithology Tagging
+        litho_tag = ""
+        if sample_type == "Concrete - I.S.465":
+            litho_tag = st.selectbox("I.S. 465 Main Aggregate Lithology Tag (3-Letter Code)", IS465_LITHOLOGY_CODES)
 
         st.markdown("---")
         st.subheader("📐 Point Count Geometry & Traverse Metrics")
@@ -295,13 +353,13 @@ with main_tab1:
 
         st.caption(f"ℹ️ **Exclusion Notice:** {na_count} 'NA' points excluded from modal calculations. Valid count: {valid_points_count}.")
 
+        # Aggregate Recycled Tagging
         tagging_data = {}
         if sample_type == "Aggregate - Recycled":
             st.markdown("---")
-            st.subheader("🏷️ Step 2B: Recycled Aggregate Phase Tagging (EN 933-11)")
+            st.subheader("🏷️ Recycled Aggregate Phase Tagging (EN 933-11)")
             
             active_phases = df_valid["Standardized_Phase"].unique().tolist()
-            
             for phase in active_phases:
                 st.write(f"##### Phase: **{phase}**")
                 t_col1, t_col2, t_col3 = st.columns(3)
@@ -349,52 +407,60 @@ with main_tab1:
             st.plotly_chart(fig_bar, use_container_width=True)
 
         # ---------------------------------------------------------
-        # STACKED BAR CHARTS (FIXED)
+        # RESTORED MODULE: Concrete - I.S. 465 Derivations
         # ---------------------------------------------------------
-        if sample_type == "Aggregate - Recycled":
+        if sample_type == "Concrete - I.S.465":
             st.markdown("---")
-            st.subheader("📈 Recycled Aggregate 100% Stacked Tag Plots")
+            st.subheader("🧱 Concrete - I.S. 465 Aggregate Derivations")
+            
+            good_agg_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Good Aggregate", case=False), "Point_Count"].sum()
+            bad_agg_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Bad Aggregate", case=False), "Point_Count"].sum()
+            total_agg_cnt = good_agg_cnt + bad_agg_cnt
 
-            st_tab1, st_tab2, st_tab3 = st.tabs(["EN933-11 Classification", "Carbonation State", "Liberation Index"])
+            if total_agg_cnt > 0:
+                total_agg_pct = (total_agg_cnt / valid_points_count) * 100
+                pct_good_of_agg = (good_agg_cnt / total_agg_cnt) * 100
+                pct_bad_of_agg = (bad_agg_cnt / total_agg_cnt) * 100
 
-            with st_tab1:
-                df_en = df_valid.groupby(["Standardized_Phase", "EN933_Class"]).size().reset_index(name="Count")
-                phase_totals = df_en.groupby("Standardized_Phase")["Count"].transform("sum")
-                df_en["Percentage"] = (df_en["Count"] / phase_totals) * 100
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Overall Aggregate Content", f"{total_agg_pct:.2f} %")
+                m2.metric("% Good Aggregate (of Total Agg)", f"{pct_good_of_agg:.2f} %")
+                m3.metric("% Bad Aggregate (of Total Agg)", f"{pct_bad_of_agg:.2f} %")
+            else:
+                st.warning("No points mapped to 'Good Aggregate' or 'Bad Aggregate' were found in this sample.")
+
+        # ---------------------------------------------------------
+        # MODULE: AGGREGATE DENSITY, WEIGHT %, AND BS 8500 ASR RISK
+        # ---------------------------------------------------------
+        if sample_type in ["Aggregates", "Aggregate - Recycled"]:
+            st.markdown("---")
+            st.subheader("⚖️ Aggregate Density, Weight % (wt%), & BS 8500-2 ASR Risk")
+
+            agg_tab1, agg_tab2 = st.tabs(["Phase Densities & wt% Recalculation", "BS 8500-2 Annex C ASR Assessment"])
+
+            with agg_tab1:
+                st.write("Enter density values (g/cm³) to calculate Weight Percentages (wt%):")
+                densities = []
+                d_cols = st.columns(len(summary))
                 
-                fig_en = px.bar(
-                    df_en, x="Standardized_Phase", y="Percentage", color="EN933_Class",
-                    title="100% Stacked Chart: EN933-11 Class by Phase",
-                    barmode="stack"
-                )
-                fig_en.update_layout(yaxis=dict(ticksuffix="%"))
-                st.plotly_chart(fig_en, use_container_width=True)
-
-            with st_tab2:
-                df_carb = df_valid.groupby(["Standardized_Phase", "Carbonation"]).size().reset_index(name="Count")
-                phase_totals_c = df_carb.groupby("Standardized_Phase")["Count"].transform("sum")
-                df_carb["Percentage"] = (df_carb["Count"] / phase_totals_c) * 100
+                for idx, row in summary.iterrows():
+                    phase_n = row["Standardized_Phase"]
+                    def_d = DEFAULT_DENSITIES.get(phase_n, 2.65)
+                    with d_cols[idx % len(d_cols)]:
+                        d_val = st.number_input(f"Density: {phase_n}", value=def_d, step=0.05, key=f"d_{phase_n}")
+                        densities.append(d_val)
                 
-                fig_carb = px.bar(
-                    df_carb, x="Standardized_Phase", y="Percentage", color="Carbonation",
-                    title="100% Stacked Chart: Carbonation State by Phase",
-                    barmode="stack"
-                )
-                fig_carb.update_layout(yaxis=dict(ticksuffix="%"))
-                st.plotly_chart(fig_carb, use_container_width=True)
+                summary["Density (g/cm³)"] = densities
+                mass_factor = summary["Modal_Percent (%)"] * summary["Density (g/cm³)"]
+                summary["Weight_Percent (%)"] = (mass_factor / mass_factor.sum()) * 100
+                summary["Weight_Percent (%)"] = summary["Weight_Percent (%)"].round(2)
 
-            with st_tab3:
-                df_lib = df_valid.groupby(["Standardized_Phase", "Liberation"]).size().reset_index(name="Count")
-                phase_totals_l = df_lib.groupby("Standardized_Phase")["Count"].transform("sum")
-                df_lib["Percentage"] = (df_lib["Count"] / phase_totals_l) * 100
-                
-                fig_lib = px.bar(
-                    df_lib, x="Standardized_Phase", y="Percentage", color="Liberation",
-                    title="100% Stacked Chart: Liberation Index by Phase",
-                    barmode="stack"
-                )
-                fig_lib.update_layout(yaxis=dict(ticksuffix="%"))
-                st.plotly_chart(fig_lib, use_container_width=True)
+                st.dataframe(summary[["Standardized_Phase", "Point_Count", "Modal_Percent (%)", "Density (g/cm³)", "Weight_Percent (%)"]], use_container_width=True)
+
+            with agg_tab2:
+                asr_risk, asr_desc = evaluate_asr_risk(summary)
+                st.metric("BS 8500-2 Annex C ASR Risk Rating", asr_risk)
+                st.info(asr_desc)
 
         st.markdown("---")
         st.subheader("📍 Thin Section Point Spatial Distribution & Index")
@@ -431,7 +497,8 @@ with main_tab1:
                 "total_points": len(df_raw),
                 "valid_points": valid_points_count,
                 "area_mm2": area_mm2,
-                "linear_traverse_mm": total_linear_traverse_mm
+                "linear_traverse_mm": total_linear_traverse_mm,
+                "lithology_code": litho_tag
             }
             
             if sample_type == "Aggregate - Recycled":
@@ -441,7 +508,7 @@ with main_tab1:
                 )
                 
             save_sample_to_db(meta_payload, summary)
-            st.success(f"Sample '{sample_id}' saved to local SQLite database (`{DB_FILE}`)!")
+            st.success(f"Sample '{sample_id}' saved to local database!")
 
         csv_data = summary.to_csv(index=False).encode('utf-8')
         col_dl.download_button(
@@ -453,7 +520,57 @@ with main_tab1:
     else:
         st.info("👈 Please upload a point count CSV/TSV file from the sidebar to begin.")
 
+# =========================================================
+# TAB 2: CONCRETE MIX DESIGN PLACEHOLDER
+# =========================================================
 with main_tab2:
+    st.header("🏗️ Concrete Mix Design Calculation Engine")
+    st.info("Load saved concrete thin section point count data from the database to derive paste/aggregate ratios and mix parameters.")
+    
+    df_samples = load_all_samples()
+    if not df_samples.empty:
+        conc_samples = df_samples[df_samples["sample_type"].str.contains("Concrete", case=False)]
+        if not conc_samples.empty:
+            sel_conc = st.selectbox("Select Concrete Sample from Database", conc_samples["sample_id"].unique())
+            st.write(f"Loaded Concrete Sample: **{sel_conc}**")
+            st.caption("⚙️ Concrete mix proportioning calculations (Paste %, Aggregate %, Air Content %, estimated W/C ratio) will render here.")
+        else:
+            st.warning("No Concrete samples found in the database yet.")
+    else:
+        st.info("No saved database samples available.")
+
+# =========================================================
+# TAB 3: MULTI-SAMPLE COMPARISON PLACEHOLDER
+# =========================================================
+with main_tab3:
+    st.header("📊 Multi-Sample Comparative Analysis Dashboard")
+    st.info("Compare petrographic results across multiple samples of the same sample type.")
+    
+    df_samples = load_all_samples()
+    if not df_samples.empty:
+        comp_type = st.selectbox("Select Sample Type to Compare", df_samples["sample_type"].unique())
+        filtered_s = df_samples[df_samples["sample_type"] == comp_type]
+        st.write(f"Found **{len(filtered_s)}** samples for type: **{comp_type}**")
+        st.dataframe(filtered_s, use_container_width=True)
+        st.caption("⚙️ Multi-sample trend plots, ternary compilation diagrams, and aggregate variability tables will render here.")
+    else:
+        st.info("No saved database samples available.")
+
+# =========================================================
+# TAB 4: GEOLOGICAL DRIVE RESOURCES PLACEHOLDER
+# =========================================================
+with main_tab4:
+    st.header("🌐 Geological Google Drive Resources")
+    st.info("Connect to Google Drive hosted geological manuals, thin section reference atlases, and standards.")
+    
+    st.text_input("Google Drive Folder ID / Share Link", value="https://drive.google.com/drive/folders/placeholder")
+    st.button("🔗 Connect to Google Workspace Drive")
+    st.caption("⚙️ PDF reference viewer and aggregate lithology optical reference photos will load here.")
+
+# =========================================================
+# TAB 5: LOCAL DATABASE BROWSER
+# =========================================================
+with main_tab5:
     st.subheader("📁 Saved Geological Samples History")
     df_history = load_all_samples()
     
