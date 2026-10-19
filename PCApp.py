@@ -290,3 +290,58 @@ with main_tab1:
             if df_raw.shape[1] == 1:
                 uploaded_file.seek(0)
                 df_raw = pd.read_csv(uploaded_file, sep=",", header=None)
+            df_raw.columns = ["Image_File", "Point_ID", "X", "Y", "Raw_Term", "Code_ID", "Timestamp"]
+        except Exception as e:
+            st.error(f"Error reading file structure: {e}")
+            st.stop()
+
+        st.subheader("📋 Step 1: Ingestion & Metadata Overview")
+        col1, col2, col3, col4 = st.columns(4)
+        sample_id = col1.text_input("Sample ID", value=df_raw["Image_File"].iloc[0].split(".")[0])
+        col2.metric("Job Number", job_number)
+        col3.metric("Sample Order", sample_order)
+        col4.metric("Total Gross Points", len(df_raw))
+
+        litho_tag = ""
+        if sample_type == "Concrete - I.S.465":
+            litho_tag = st.selectbox("I.S. 465 Main Aggregate Lithology Tag (3-Letter Code)", IS465_LITHOLOGY_CODES)
+
+        st.markdown("---")
+        st.subheader("📐 Point Count Geometry & Traverse Metrics")
+
+        df_raw["X_um"] = df_raw["X"] * SCALE_UM_PER_PX
+        df_raw["Y_um"] = df_raw["Y"] * SCALE_UM_PER_PX
+
+        x_min_um, x_max_um = df_raw["X_um"].min(), df_raw["X_um"].max()
+        y_min_um, y_max_um = df_raw["Y_um"].min(), df_raw["Y_um"].max()
+
+        width_um = x_max_um - x_min_um
+        height_um = y_max_um - y_min_um
+        width_mm = width_um / 1000.0
+        height_mm = height_um / 1000.0
+        area_mm2 = width_mm * height_mm
+
+        unique_y = np.sort(df_raw["Y_um"].unique())
+        unique_x = np.sort(df_raw["X_um"].unique())
+
+        num_traverses = len(unique_y)
+        num_transects = len(unique_x)
+
+        x_spacing_um = np.mean(np.diff(unique_x)) if len(unique_x) > 1 else 0.0
+        y_spacing_um = np.mean(np.diff(unique_y)) if len(unique_y) > 1 else 0.0
+        total_linear_traverse_mm = num_traverses * width_mm
+
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        m_col1.metric("X-Span (Width)", f"{width_mm:.2f} mm")
+        m_col2.metric("Y-Span (Height)", f"{height_mm:.2f} mm")
+        m_col3.metric("Bounding Area", f"{area_mm2:.2f} mm²")
+        m_col4.metric("Total Linear Traverse", f"{total_linear_traverse_mm:.2f} mm")
+
+        m_col5, m_col6, m_col7, m_col8 = st.columns(4)
+        m_col5.metric("Traverses (Rows)", num_traverses)
+        m_col6.metric("Transects (Cols)", num_transects)
+        m_col7.metric("X-Spacing", f"{x_spacing_um:.1f} μm")
+        m_col8.metric("Y-Spacing", f"{y_spacing_um:.1f} μm")
+
+        st.markdown("---")
+        st.subheader("🛠️ Step 2: Quality
