@@ -4,19 +4,22 @@ import numpy as np
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from scipy.spatial.distance import cdist  # Replaces distance_matrix to fix deprecation warning
+from scipy.spatial.distance import cdist  # Replaces distance_matrix to resolve NameError and SciPy deprecation warnings
 
-SCALE_UM_PER_PX = 1.82
+st.set_page_config(page_title="Geological Petrography QC & Analysis", layout="wide")
+
+st.title("🔬 Geological Petrography Analysis Platform")
+
+SCALE_UM_PER_PX = 1.82  # 1.82 microns per pixel
 DB_FILE = "petrography_data.db"
 
 # ---------------------------------------------------------
-# DATABASE PERSISTENCE & AUTOMATIC SCHEMA MIGRATION
+# 0. DATABASE PERSISTENCE & AUTOMATIC SCHEMA MIGRATION
 # ---------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # 1. Base Samples Master Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS samples (
             sample_id TEXT PRIMARY KEY,
@@ -32,15 +35,13 @@ def init_db():
         )
     """)
     
-    # AUTOMATIC MIGRATION: Check if lithology_code column exists, add it if missing
+    # Schema Migration: Safely add lithology_code if it does not exist
     try:
         cursor.execute("ALTER TABLE samples ADD COLUMN lithology_code TEXT;")
         conn.commit()
     except sqlite3.OperationalError:
-        # Column already exists
-        pass
+        pass  # Column already exists
     
-    # 2. Modal Results Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS modal_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,45 +61,6 @@ def init_db():
     """)
     conn.commit()
     conn.close()
-
-init_db()
-
-# ---------------------------------------------------------
-# SPATIAL INDEX (FIXED SCIPY DISTANCE FUNCTION)
-# ---------------------------------------------------------
-def calculate_spatial_index(df_points):
-    if len(df_points) < 5:
-        return None, "Insufficient points"
-    
-    coords = df_points[["X", "Y"]].values
-    
-    # Uses cdist instead of distance_matrix to avoid SciPy deprecation warnings
-    dist_mat = cdist(coords, coords, metric='euclidean')
-    np.fill_diagonal(dist_mat, np.inf)
-    
-    nearest_dists = np.min(dist_mat, axis=1)
-    mean_observed_dist = np.mean(nearest_dists)
-    
-    x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
-    y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
-    area = (x_max - x_min) * (y_max - y_min)
-    
-    if area == 0:
-        return None, "Zero Area"
-    
-    density = len(coords) / area
-    mean_expected_dist = 0.5 / np.sqrt(density)
-    
-    R = mean_observed_dist / mean_expected_dist
-    
-    if R < 0.95:
-        desc = "Clustered / Segregated"
-    elif 0.95 <= R <= 1.05:
-        desc = "Randomly Distributed"
-    else:
-        desc = "Uniformly / Regularly Distributed"
-        
-    return R, desc
 
 init_db()
 
@@ -166,7 +128,6 @@ SAMPLE_TYPES = [
     "Render/Mortar"
 ]
 
-# Paper doi.org/10.1016/j.conbuildmat.2023.133404 3-letter codes
 IS465_LITHOLOGY_CODES = [
     "MCM - Muscovite Mica",
     "MCP - Phlogopite Mica",
@@ -233,7 +194,6 @@ def classify_abundance(pct):
         return "Trace"
 
 def evaluate_asr_risk(df_summary):
-    """BS 8500-2 Annex C ASR Risk Assessor."""
     high_react = ["opal", "chalcedony", "chert", "flint", "volcanic glass", "strained quartz"]
     norm_react = ["sandstone", "greywacke", "siltstone", "microcrystalline quartz"]
     
@@ -260,7 +220,9 @@ def calculate_spatial_index(df_points):
         return None, "Insufficient points"
     
     coords = df_points[["X", "Y"]].values
-    dist_mat = distance_matrix(coords, coords)
+    
+    # Uses scipy.spatial.distance.cdist to resolve NameError and deprecation warnings
+    dist_mat = cdist(coords, coords, metric='euclidean')
     np.fill_diagonal(dist_mat, np.inf)
     
     nearest_dists = np.min(dist_mat, axis=1)
@@ -328,7 +290,6 @@ with main_tab1:
         col3.metric("Sample Order", sample_order)
         col4.metric("Total Gross Points", len(df_raw))
 
-        # I.S. 465 Lithology Tagging
         litho_tag = ""
         if sample_type == "Concrete - I.S.465":
             litho_tag = st.selectbox("I.S. 465 Main Aggregate Lithology Tag (3-Letter Code)", IS465_LITHOLOGY_CODES)
@@ -397,7 +358,6 @@ with main_tab1:
 
         st.caption(f"ℹ️ **Exclusion Notice:** {na_count} 'NA' points excluded from modal calculations. Valid count: {valid_points_count}.")
 
-        # Aggregate Recycled Tagging
         tagging_data = {}
         if sample_type == "Aggregate - Recycled":
             st.markdown("---")
@@ -450,9 +410,7 @@ with main_tab1:
             )
             st.plotly_chart(fig_bar, use_container_width=True)
 
-        # ---------------------------------------------------------
-        # RESTORED MODULE: Concrete - I.S. 465 Derivations
-        # ---------------------------------------------------------
+        # Concrete I.S. 465 Aggregate Derivations
         if sample_type == "Concrete - I.S.465":
             st.markdown("---")
             st.subheader("🧱 Concrete - I.S. 465 Aggregate Derivations")
@@ -473,9 +431,7 @@ with main_tab1:
             else:
                 st.warning("No points mapped to 'Good Aggregate' or 'Bad Aggregate' were found in this sample.")
 
-        # ---------------------------------------------------------
-        # MODULE: AGGREGATE DENSITY, WEIGHT %, AND BS 8500 ASR RISK
-        # ---------------------------------------------------------
+        # Aggregate Density, wt%, and BS 8500 ASR Module
         if sample_type in ["Aggregates", "Aggregate - Recycled"]:
             st.markdown("---")
             st.subheader("⚖️ Aggregate Density, Weight % (wt%), & BS 8500-2 ASR Risk")
