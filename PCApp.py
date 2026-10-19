@@ -4,7 +4,7 @@ import numpy as np
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from scipy.spatial.distance import cdist  # Replaces distance_matrix to prevent SciPy deprecation warnings
+from scipy.spatial.distance import cdist  # Replaces distance_matrix to avoid SciPy deprecation warnings
 
 st.set_page_config(page_title="Geological Petrography QC & Analysis", layout="wide")
 
@@ -392,4 +392,13 @@ with main_tab1:
 
             df_valid["EN933_Class"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["EN933_Class"])
             df_valid["Carbonation"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["Carbonation"])
-            df_valid["Liberation"] = df_
+            df_valid["Liberation"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["Liberation"])
+
+        st.markdown("---")
+        st.subheader("📊 Step 3: Modal Analysis Results")
+
+        summary = df_valid.groupby("Standardized_Phase").size().reset_index(name="Point_Count")
+        summary["Modal_Percent (%)"] = (summary["Point_Count"] / valid_points_count) * 100
+        
+        p = summary["Modal_Percent (%)"] / 100
+        summary["Std_Error (%)"] = 2 * np.sqrt((p * (
