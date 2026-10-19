@@ -210,3 +210,186 @@ def classify_abundance(pct):
 def evaluate_asr_risk(df_summary):
     high_react = ["opal", "chalcedony", "chert", "flint", "volcanic glass", "strained quartz"]
     norm_react = ["sandstone", "greywacke", "siltstone", "microcrystalline quartz"]
+    
+    high_pct = 0.0
+    norm_pct = 0.0
+    
+    for _, row in df_summary.iterrows():
+        p_name = str(row["Standardized_Phase"]).lower()
+        pct = row["Modal_Percent (%)"]
+        if any(h in p_name for h in high_react):
+            high_pct += pct
+        elif any(n in p_name for n in norm_react):
+            norm_pct += pct
+            
+    if high_pct > 5.0:
+        return "HIGH RISK", "🔴 Contains > 5% highly reactive silica constituents (BS 8500-2 Annex C)."
+    elif norm_pct > 10.0 or high_pct > 0.0:
+        return "MEDIUM / NORMAL RISK", "🟡 Contains normal reactivity aggregates. Apply standard concrete alkali limits."
+    else:
+        return "LOW RISK", "🟢 Predominantly low-reactivity minerals (Quartz/Feldspar/Carbonates)."
+
+def calculate_spatial_index(df_points):
+    if len(df_points) < 5:
+        return None, "Insufficient points"
+    
+    coords = df_points[["X", "Y"]].values
+    dist_mat = cdist(coords, coords, metric='euclidean')
+    np.fill_diagonal(dist_mat, np.inf)
+    
+    nearest_dists = np.min(dist_mat, axis=1)
+    mean_observed_dist = np.mean(nearest_dists)
+    
+    x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
+    y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
+    area = (x_max - x_min) * (y_max - y_min)
+    
+    if area == 0:
+        return None, "Zero Area"
+    
+    density = len(coords) / area
+    mean_expected_dist = 0.5 / np.sqrt(density)
+    
+    R = mean_observed_dist / mean_expected_dist
+    
+    if R < 0.95:
+        desc = "Clustered / Segregated"
+    elif 0.95 <= R <= 1.05:
+        desc = "Randomly Distributed"
+    else:
+        desc = "Uniformly / Regularly Distributed"
+        
+    return R, desc
+
+# ---------------------------------------------------------
+# MAIN TAB NAVIGATION
+# ---------------------------------------------------------
+main_tab1, main_tab2, main_tab3, main_tab4, main_tab5 = st.tabs([
+    "🔬 Sample Point Count Analysis", 
+    "🏗️ Concrete Mix Design (DB)", 
+    "📊 Multi-Sample Comparison", 
+    "🌐 Geological Drive Resources",
+    "📁 Local Database Browser"
+])
+
+# =========================================================
+# TAB 1: CURRENT SAMPLE ANALYSIS
+# =========================================================
+with main_tab1:
+    st.sidebar.header("1. Upload & Job Metadata")
+    uploaded_file = st.sidebar.file_uploader("Upload Point Count File (CSV/TSV)", type=["txt", "tsv", "csv"])
+
+    job_number = st.sidebar.text_input("Job Number", value="JOB-2026-001")
+    sample_order = st.sidebar.text_input("Sample Order", value="1")
+    sample_type = st.sidebar.selectbox("Sample Type", SAMPLE_TYPES)
+    operator = st.sidebar.text_input("Operator Name", value="Analyst")
+
+    if uploaded_file is not None:
+        try:
+            df_raw = pd.read_csv(uploaded_file, sep="\t", header=None)
+            if df_raw.shape[1] == 1:
+                uploaded_file.seek(0)
+                df_raw = pd.read_csv(uploaded_file, sep=",", header=None)
+            df_raw.columns = ["Image_File", "Point_ID", "X", "Y", "Raw_Term", "Code_ID", "Timestamp"]
+        except Exception as e:
+            st.error(f"Error reading file structure: {e}")
+            st.stop()
+
+        st.subheader("📋 Step 1: Ingestion & Metadata Overview")
+        col1, col2, col3, col4 = st.columns(4)
+        sample_id = col1.text_input("Sample ID", value=df_raw["Image_File"].iloc[0].split(".")[0])
+        col2.metric("Job Number", job_number)
+        col3.metric("Sample Order", sample_order)
+        col4.metric("Total Gross Points", len(df_raw))
+
+        litho_tag = ""
+        if sample_type == "Concrete - I.S.465":
+            litho_tag = st.selectbox("I.S. 465 Main Aggregate Lithology Tag (3-Letter Code)", IS465_LITHOLOGY_CODES)
+
+        st.markdown("---")
+        st.subheader("📐 Point Count Geometry & Traverse Metrics")
+
+        df_raw["X_um"] = df_raw["X"] * SCALE_UM_PER_PX
+        df_raw["Y_um"] = df_raw["Y"] * SCALE_UM_PER_PX
+
+        x_min_um, x_max_um = df_raw["X_um"].min(), df_raw["X_um"].max()
+        y_min_um, y_max_um = df_raw["Y_um"].min(), df_raw["Y_um"].max()
+
+        width_um = x_max_um - x_min_um
+        height_um = y_max_um - y_min_um
+        width_mm = width_um / 1000.0
+        height_mm = height_um / 1000.0
+        area_mm2 = width_mm * height_mm
+
+        unique_y = np.sort(df_raw["Y_um"].unique())
+        unique_x = np.sort(df_raw["X_um"].unique())
+
+        num_traverses = len(unique_y)
+        num_transects = len(unique_x)
+
+        x_spacing_um = np.mean(np.diff(unique_x)) if len(unique_x) > 1 else 0.0
+        y_spacing_um = np.mean(np.diff(unique_y)) if len(unique_y) > 1 else 0.0
+        total_linear_traverse_mm = num_traverses * width_mm
+
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        m_col1.metric("X-Span (Width)", f"{width_mm:.2f} mm")
+        m_col2.metric("Y-Span (Height)", f"{height_mm:.2f} mm")
+        m_col3.metric("Bounding Area", f"{area_mm2:.2f} mm²")
+        m_col4.metric("Total Linear Traverse", f"{total_linear_traverse_mm:.2f} mm")
+
+        m_col5, m_col6, m_col7, m_col8 = st.columns(4)
+        m_col5.metric("Traverses (Rows)", num_traverses)
+        m_col6.metric("Transects (Cols)", num_transects)
+        m_col7.metric("X-Spacing", f"{x_spacing_um:.1f} μm")
+        m_col8.metric("Y-Spacing", f"{y_spacing_um:.1f} μm")
+
+        st.markdown("---")
+        st.subheader("🛠️ Step 2: Quality Control (QC) & Term Mapping")
+        
+        unique_terms = df_raw["Raw_Term"].unique().tolist()
+        lookup = DEFAULT_LOOKUPS.get(sample_type, {})
+        
+        mapping_dict = {}
+        qc_cols = st.columns(2)
+        
+        for idx, term in enumerate(unique_terms):
+            default_val = lookup.get(term, term)
+            with qc_cols[idx % 2]:
+                mapping_dict[term] = st.text_input(
+                    label=f"Raw Term: **{term}**", 
+                    value=default_val, 
+                    key=f"map_{term}"
+                )
+
+        df_mapped = df_raw.copy()
+        df_mapped["Standardized_Phase"] = df_mapped["Raw_Term"].map(mapping_dict)
+
+        df_valid = df_mapped[df_mapped["Standardized_Phase"].str.upper() != "NA"].copy()
+        valid_points_count = len(df_valid)
+        na_count = len(df_mapped) - valid_points_count
+
+        st.caption(f"ℹ️ **Exclusion Notice:** {na_count} 'NA' points excluded from modal calculations. Valid count: {valid_points_count}.")
+
+        tagging_data = {}
+        if sample_type == "Aggregate - Recycled":
+            st.markdown("---")
+            st.subheader("🏷️ Recycled Aggregate Phase Tagging (EN 933-11)")
+            
+            active_phases = df_valid["Standardized_Phase"].unique().tolist()
+            for phase in active_phases:
+                st.write(f"##### Phase: **{phase}**")
+                t_col1, t_col2, t_col3 = st.columns(3)
+                
+                en_class = t_col1.selectbox(f"EN933-11 Class ({phase})", EN933_11_CLASSES, key=f"en_{phase}")
+                carb_state = t_col2.selectbox(f"Carbonation ({phase})", CARBONATION_STATES, key=f"carb_{phase}")
+                lib_idx = t_col3.selectbox(f"Liberation Index ({phase})", LIBERATION_INDEXES, key=f"lib_{phase}")
+                
+                tagging_data[phase] = {
+                    "EN933_Class": en_class,
+                    "Carbonation": carb_state,
+                    "Liberation": lib_idx
+                }
+
+            df_valid["EN933_Class"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["EN933_Class"])
+            df_valid["Carbonation"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["Carbonation"])
+            df_valid["Liberation"] = df_
