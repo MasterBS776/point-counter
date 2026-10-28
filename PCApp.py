@@ -410,6 +410,10 @@ with main_tab1:
         summary["Modal_Percent (%)"] = summary["Modal_Percent (%)"].round(2)
         summary["Std_Error (%)"] = summary["Std_Error (%)"].round(2)
 
+        # Store in session state for cross-module concrete mix design calculations
+        st.session_state["active_sample_id"] = sample_id
+        st.session_state["active_summary"] = summary.copy()
+
         col_tbl, col_chart = st.columns([1.2, 1])
         with col_tbl:
             st.write("##### Phase Modal Percentage Table")
@@ -644,67 +648,135 @@ with main_tab2:
         st.info("No saved samples available in the database to edit yet.")
 
 # =========================================================
-# TAB 3: CONCRETE MIX DESIGN PLACEHOLDER
+# TAB 3: CONCRETE MIX DESIGN ENGINE (APPROACH B & A)
 # =========================================================
 with main_tab3:
-    st.header("🏗️ Concrete Mix Design Calculation Engine")
-    st.info("Load saved concrete thin section point count data from the database to derive paste/aggregate ratios and mix parameters.")
-    
-    df_samples = load_all_samples()
-    if not df_samples.empty:
-        conc_samples = df_samples[df_samples["sample_type"].str.contains("Concrete", case=False)]
-        if not conc_samples.empty:
-            sel_conc = st.selectbox("Select Concrete Sample from Database", conc_samples["sample_id"].unique())
-            st.write(f"Loaded Concrete Sample: **{sel_conc}**")
-            st.caption("⚙️ Concrete mix proportioning calculations (Paste %, Aggregate %, Air Content %, estimated W/C ratio) will render here.")
+    st.header("🏗️ Hardened Concrete Mix Reverse-Engineering & Performance Engine")
+    st.info("Back-calculate original concrete mix proportions ($1\\text{ m}^3$), 28-day cube strength (UK DoE 1B), and fresh slump using stereological modal points.")
+
+    mix_source = st.radio("Select Modal Data Source:", ["Active Session Point Count", "Load Sample from Database"], horizontal=True)
+
+    df_mix_input = pd.DataFrame()
+    mix_sample_label = "Unassigned"
+
+    if mix_source == "Active Session Point Count":
+        if "active_summary" in st.session_state and not st.session_state["active_summary"].empty:
+            df_mix_input = st.session_state["active_summary"].copy()
+            df_mix_input.rename(columns={"Standardized_Phase": "Phase", "Modal_Percent (%)": "Vol_Pct"}, inplace=True)
+            mix_sample_label = st.session_state.get("active_sample_id", "Active Sample")
+            st.success(f"Loaded active point count data for: **{mix_sample_label}**")
         else:
-            st.warning("No Concrete samples found in the database yet.")
+            st.warning("No active sample point count found in Tab 1. Upload a sample or choose 'Load Sample from Database'.")
     else:
-        st.info("No saved database samples available.")
+        df_all_db = load_all_samples()
+        if not df_all_db.empty:
+            concrete_db = df_all_db[df_all_db["sample_type"].str.contains("Concrete", case=False)]
+            if not concrete_db.empty:
+                sel_db_mix = st.selectbox("Select Concrete Sample from Database:", concrete_db["sample_id"].unique(), key="sel_mix_db")
+                df_modal_db = load_sample_details(sel_db_mix)
+                df_mix_input = df_modal_db.rename(columns={"phase_name": "Phase", "modal_percent": "Vol_Pct"}).copy()
+                mix_sample_label = sel_db_mix
+                st.success(f"Loaded database point count data for: **{mix_sample_label}**")
+            else:
+                st.warning("No samples categorized as 'Concrete' found in the database.")
+        else:
+            st.info("The database is currently empty. Process samples in Tab 1 first.")
 
-# =========================================================
-# TAB 4: MULTI-SAMPLE COMPARISON PLACEHOLDER
-# =========================================================
-with main_tab4:
-    st.header("📊 Multi-Sample Comparative Analysis Dashboard")
-    st.info("Compare petrographic results across multiple samples of the same sample type.")
-    
-    df_samples = load_all_samples()
-    if not df_samples.empty:
-        comp_type = st.selectbox("Select Sample Type to Compare", df_samples["sample_type"].unique())
-        filtered_s = df_samples[df_samples["sample_type"] == comp_type]
-        st.write(f"Found **{len(filtered_s)}** samples for type: **{comp_type}**")
-        st.dataframe(filtered_s, use_container_width=True)
-        st.caption("⚙️ Multi-sample trend plots, ternary compilation diagrams, and aggregate variability tables will render here.")
-    else:
-        st.info("No saved database samples available.")
-
-# =========================================================
-# TAB 5: GEOLOGICAL DRIVE RESOURCES PLACEHOLDER
-# =========================================================
-with main_tab5:
-    st.header("🌐 Geological Google Drive Resources")
-    st.info("Connect to Google Drive hosted geological manuals, thin section reference atlases, and standards.")
-    
-    st.text_input("Google Drive Folder ID / Share Link", value="https://drive.google.com/drive/folders/placeholder")
-    st.button("🔗 Connect to Google Workspace Drive")
-    st.caption("⚙️ PDF reference viewer and aggregate lithology optical reference photos will load here.")
-
-# =========================================================
-# TAB 6: LOCAL DATABASE BROWSER
-# =========================================================
-with main_tab6:
-    st.subheader("📁 Saved Geological Samples History")
-    df_history = load_all_samples()
-    
-    if not df_history.empty:
-        st.dataframe(df_history, use_container_width=True)
+    if not df_mix_input.empty:
+        st.markdown("---")
+        st.subheader("1. Component Classification & Physical Densities")
         
-        selected_sample = st.selectbox("Select Sample to View Modal Breakdown", df_history["sample_id"].unique())
-        if selected_sample:
-            df_modal_history = load_sample_details(selected_sample)
-            st.write(f"##### Modal Breakdown for: **{selected_sample}**")
-            st.dataframe(df_modal_history, use_container_width=True)
-    else:
-        st.info("No saved samples found in the local database yet.")
+        # Categorization helper
+        def auto_classify(p_name):
+            p = str(p_name).lower()
+            if any(k in p for k in ["paste", "cement", "binder", "matrix"]):
+                return "Cement Paste / Binder"
+            elif any(k in p for k in ["void", "air", "pore"]):
+                return "Air Voids"
+            elif any(k in p for k in ["sand", "fine", "matrix sand"]):
+                return "Fine Aggregate"
+            else:
+                return "Coarse Aggregate"
+
+        classifications = []
+        c_cols = st.columns(min(len(df_mix_input), 4))
+        for idx, row in df_mix_input.iterrows():
+            p_name = row["Phase"]
+            def_cat = auto_classify(p_name)
+            with c_cols[idx % len(c_cols)]:
+                cat = st.selectbox(
+                    f"Role: **{p_name}** ({row['Vol_Pct']:.1f}%)",
+                    ["Cement Paste / Binder", "Fine Aggregate", "Coarse Aggregate", "Air Voids"],
+                    index=["Cement Paste / Binder", "Fine Aggregate", "Coarse Aggregate", "Air Voids"].index(def_cat),
+                    key=f"cat_{p_name}"
+                )
+                classifications.append(cat)
+                
+        df_mix_input["Role"] = classifications
+
+        v_paste = df_mix_input.loc[df_mix_input["Role"] == "Cement Paste / Binder", "Vol_Pct"].sum()
+        v_fine = df_mix_input.loc[df_mix_input["Role"] == "Fine Aggregate", "Vol_Pct"].sum()
+        v_coarse = df_mix_input.loc[df_mix_input["Role"] == "Coarse Aggregate", "Vol_Pct"].sum()
+        v_void = df_mix_input.loc[df_mix_input["Role"] == "Air Voids", "Vol_Pct"].sum()
+
+        st.write("##### Consolidated Volumetric Breakdown (Stereological Area % = Vol %)")
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("Cement Paste Volume", f"{v_paste:.2f} %")
+        b2.metric("Fine Aggregate Volume", f"{v_fine:.2f} %")
+        b3.metric("Coarse Aggregate Volume", f"{v_coarse:.2f} %")
+        b4.metric("Macroscopic Air Voids", f"{v_void:.2f} %")
+
+        st.markdown("---")
+        st.subheader("2. Petrographic Mix Inputs & Reverse-Engineering Model")
+
+        p_col1, p_col2 = st.columns(2)
+        with p_col1:
+            wb_ratio = st.slider(
+                "Petrographically Estimated Water/Binder Ratio (w/b):",
+                min_value=0.25, max_value=0.80, value=0.48, step=0.01,
+                help="Derived from fluorescent thin section dye intensity against reference paste standards and capillary porosity."
+            )
+            calc_approach = st.radio(
+                "Calculation Formulation:",
+                ["Approach B: Mass Balance (BS 1881-124 / ASTM C856) [Default]", 
+                 "Approach A: Physical Hydration (Powers-Brownyard)"],
+                index=0
+            )
+
+        with p_col2:
+            scm_type = st.selectbox(
+                "Binder Composition (SCM Replacement):",
+                ["100% CEM I (Portland)", "30% GGBS (Slag)", "25% PFA (Fly Ash)", "7% Silica Fume"]
+            )
+            d_col1, d_col2, d_col3 = st.columns(3)
+            # Effective binder density based on SCM
+            if "GGBS" in scm_type:
+                def_rho_b = 3.07
+            elif "PFA" in scm_type:
+                def_rho_b = 2.94
+            elif "Silica Fume" in scm_type:
+                def_rho_b = 3.08
+            else:
+                def_rho_b = 3.15
+
+            rho_cement = d_col1.number_input("Binder Density (g/cm³)", value=float(def_rho_b), step=0.01)
+            rho_fine = d_col2.number_input("Fine Agg Density (g/cm³)", value=2.65, step=0.01)
+            rho_coarse = d_col3.number_input("Coarse Agg Density (g/cm³)", value=2.68, step=0.01)
+
+        # ---------------------------------------------------------
+        # MIX RECONSTRUCTION CALCULATIONS
+        # ---------------------------------------------------------
+        rho_water = 1.00  # g/cm³ or 1000 kg/m³
+        v_total_agg = v_fine + v_coarse
+
+        # APPROACH B: Absolute Volume Conservation (Mass Balance)
+        c_kg_b = (1.0 - ((v_total_agg + v_void) / 100.0)) / ((1.0 / (rho_cement * 1000.0)) + (wb_ratio / (rho_water * 1000.0)))
+        w_kg_b = c_kg_b * wb_ratio
+        fine_kg_b = 1000.0 * (v_fine / 100.0) * rho_fine
+        coarse_kg_b = 1000.0 * (v_coarse / 100.0) * rho_coarse
+        fresh_density_b = c_kg_b + w_kg_b + fine_kg_b + coarse_kg_b
+
+        # APPROACH A: Powers-Brownyard Hydration Stoichiometry
+        v_c0_pct = v_paste / (1.0 + wb_ratio * (rho_cement / rho_water))
+        c_kg_a = 1000.0 * (v_c0_pct / 100.0
         
