@@ -1,5 +1,6 @@
 import sqlite3
 import io
+import struct
 import datetime
 import pandas as pd
 import numpy as np
@@ -11,9 +12,9 @@ from scipy.spatial.distance import cdist
 # ReportLab imports for direct in-memory PDF generation
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.graphics.shapes import Drawing, Rect, String, Line
+from reportlab.graphics.shapes import Drawing, Rect, String
 
 st.set_page_config(page_title="Geological Petrography QC & Analysis", layout="wide")
 
@@ -45,7 +46,6 @@ def init_db():
         )
     """)
     
-    # Auto-migrate 'samples' table if missing 'lithology_code'
     try:
         cursor.execute("ALTER TABLE samples ADD COLUMN lithology_code TEXT;")
         conn.commit()
@@ -69,7 +69,6 @@ def init_db():
         )
     """)
     
-    # Auto-migrate 'modal_results' table if missing density columns
     try:
         cursor.execute("ALTER TABLE modal_results ADD COLUMN density_gcm3 REAL;")
         conn.commit()
@@ -87,6 +86,25 @@ def init_db():
 
 init_db()
 
+def _clean_numeric_val(val, to_float=False):
+    """Safely converts potential byte-blobs or malformed values from SQLite to clean numbers."""
+    if pd.isna(val) or val is None:
+        return 0.0 if to_float else 0
+    if isinstance(val, (bytes, bytearray)):
+        try:
+            fmt = '<d' if to_float else '<q'
+            return struct.unpack(fmt, val[:8])[0]
+        except Exception:
+            try:
+                fmt = '<f' if to_float else '<i'
+                return struct.unpack(fmt, val[:4])[0]
+            except Exception:
+                return 0.0 if to_float else 0
+    try:
+        return float(val) if to_float else int(val)
+    except (ValueError, TypeError):
+        return 0.0 if to_float else 0
+
 def save_sample_to_db(sample_meta, df_summary):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -96,31 +114,49 @@ def save_sample_to_db(sample_meta, df_summary):
         (sample_id, job_number, sample_order, sample_type, operator, total_points, valid_points, bounding_area_mm2, linear_traverse_mm, lithology_code)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        sample_meta["sample_id"], sample_meta["job_number"], sample_meta["sample_order"],
-        sample_meta["sample_type"], sample_meta["operator"], sample_meta["total_points"],
-        sample_meta["valid_points"], sample_meta["area_mm2"], sample_meta["linear_traverse_mm"],
-        sample_meta.get("lithology_code", "")
+        str(sample_meta["sample_id"]),
+        str(sample_meta["job_number"]),
+        str(sample_meta["sample_order"]),
+        str(sample_meta["sample_type"]),
+        str(sample_meta["operator"]),
+        int(_clean_numeric_val(sample_meta["total_points"], to_float=False)),
+        int(_clean_numeric_val(sample_meta["valid_points"], to_float=False)),
+        float(_clean_numeric_val(sample_meta["area_mm2"], to_float=True)),
+        float(_clean_numeric_val(sample_meta["linear_traverse_mm"], to_float=True)),
+        str(sample_meta.get("lithology_code", ""))
     ))
     
-    cursor.execute("DELETE FROM modal_results WHERE sample_id = ?", (sample_meta["sample_id"],))
+    cursor.execute("DELETE FROM modal_results WHERE sample_id = ?", (str(sample_meta["sample_id"]),))
     
     for _, row in df_summary.iterrows():
+        p_name = str(row.get("Standardized_Phase", row.get("phase_name", "")))
+        p_count = int(_clean_numeric_val(row.get("Point_Count", row.get("point_count", 0)), to_float=False))
+        m_pct = float(_clean_numeric_val(row.get("Modal_Percent (%)", row.get("modal_percent", 0.0)), to_float=True))
+        s_err = float(_clean_numeric_val(row.get("Std_Error (%)", row.get("std_error", 0.0)), to_float=True))
+        abun = row.get("Abundance", row.get("abundance", None))
+        
+        raw_dens = row.get("Density (g/cm³)", row.get("density_gcm3", None))
+        d_val = float(_clean_numeric_val(raw_dens, to_float=True)) if pd.notnull(raw_dens) else None
+        
+        raw_wt = row.get("Weight_Percent (%)", row.get("wt_percent", None))
+        wt_val = float(_clean_numeric_val(raw_wt, to_float=True)) if pd.notnull(raw_wt) else None
+
         cursor.execute("""
             INSERT INTO modal_results 
             (sample_id, phase_name, point_count, modal_percent, std_error, abundance, density_gcm3, wt_percent, en933_class, carbonation, liberation)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            sample_meta["sample_id"],
-            row.get("Standardized_Phase", row.get("phase_name", "")),
-            int(row.get("Point_Count", row.get("point_count", 0))),
-            float(row.get("Modal_Percent (%)", row.get("modal_percent", 0.0))),
-            float(row.get("Std_Error (%)", row.get("std_error", 0.0))),
-            row.get("Abundance", row.get("abundance", None)),
-            float(row.get("Density (g/cm³)", row.get("density_gcm3", 2.65))) if pd.notnull(row.get("Density (g/cm³)", row.get("density_gcm3", None))) else None,
-            float(row.get("Weight_Percent (%)", row.get("wt_percent", 0.0))) if pd.notnull(row.get("Weight_Percent (%)", row.get("wt_percent", None))) else None,
-            row.get("EN933_Class", row.get("en933_class", None)),
-            row.get("Carbonation", row.get("carbonation", None)),
-            row.get("Liberation", row.get("liberation", None))
+            str(sample_meta["sample_id"]),
+            p_name,
+            p_count,
+            m_pct,
+            s_err,
+            str(abun) if abun is not None else None,
+            d_val,
+            wt_val,
+            str(row.get("EN933_Class", row.get("en933_class", ""))) or None,
+            str(row.get("Carbonation", row.get("carbonation", ""))) or None,
+            str(row.get("Liberation", row.get("liberation", ""))) or None
         ))
         
     conn.commit()
@@ -130,12 +166,36 @@ def load_all_samples():
     conn = sqlite3.connect(DB_FILE)
     df_samples = pd.read_sql_query("SELECT * FROM samples ORDER BY created_at DESC", conn)
     conn.close()
+    
+    if not df_samples.empty:
+        # Sanitize any columns that could contain corrupted binary buffers
+        df_samples["total_points"] = df_samples["total_points"].apply(lambda v: _clean_numeric_val(v, to_float=False))
+        df_samples["valid_points"] = df_samples["valid_points"].apply(lambda v: _clean_numeric_val(v, to_float=False))
+        df_samples["bounding_area_mm2"] = df_samples["bounding_area_mm2"].apply(lambda v: _clean_numeric_val(v, to_float=True))
+        df_samples["linear_traverse_mm"] = df_samples["linear_traverse_mm"].apply(lambda v: _clean_numeric_val(v, to_float=True))
+        
+        for col in ["sample_id", "job_number", "sample_order", "sample_type", "operator", "lithology_code", "created_at"]:
+            if col in df_samples.columns:
+                df_samples[col] = df_samples[col].astype(str)
+                
     return df_samples
 
 def load_sample_details(sample_id):
     conn = sqlite3.connect(DB_FILE)
-    df_results = pd.read_sql_query("SELECT * FROM modal_results WHERE sample_id = ?", conn, params=(sample_id,))
+    df_results = pd.read_sql_query("SELECT * FROM modal_results WHERE sample_id = ?", conn, params=(str(sample_id),))
     conn.close()
+    
+    if not df_results.empty:
+        df_results["point_count"] = df_results["point_count"].apply(lambda v: _clean_numeric_val(v, to_float=False))
+        df_results["modal_percent"] = df_results["modal_percent"].apply(lambda v: _clean_numeric_val(v, to_float=True))
+        df_results["std_error"] = df_results["std_error"].apply(lambda v: _clean_numeric_val(v, to_float=True))
+        df_results["density_gcm3"] = df_results["density_gcm3"].apply(lambda v: _clean_numeric_val(v, to_float=True) if pd.notnull(v) else np.nan)
+        df_results["wt_percent"] = df_results["wt_percent"].apply(lambda v: _clean_numeric_val(v, to_float=True) if pd.notnull(v) else np.nan)
+        
+        for col in ["phase_name", "abundance", "en933_class", "carbonation", "liberation"]:
+            if col in df_results.columns:
+                df_results[col] = df_results[col].astype(str).replace({"None": "", "nan": ""})
+                
     return df_results
 
 # ---------------------------------------------------------
@@ -225,7 +285,7 @@ def evaluate_asr_risk(df_summary):
     
     for _, row in df_summary.iterrows():
         p_name = str(row.get("Standardized_Phase", row.get("phase_name", ""))).lower()
-        pct = float(row.get("Modal_Percent (%)", row.get("modal_percent", 0.0)))
+        pct = float(_clean_numeric_val(row.get("Modal_Percent (%)", row.get("modal_percent", 0.0)), to_float=True))
         if any(h in p_name for h in high_react):
             high_pct += pct
         elif any(n in p_name for n in norm_react):
@@ -274,7 +334,6 @@ def calculate_spatial_index(df_points):
 # PDF REPORT GENERATOR HELPER FUNCTION (REPORTLAB)
 # ---------------------------------------------------------
 def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, mass_pcts):
-    """Generates an executive concrete mix design PDF report with embedded table and chart."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -317,12 +376,10 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
     
     story = []
     
-    # Title & Header
     story.append(Paragraph("Concrete Mix Reverse-Engineering & Petrographic Report", title_style))
     story.append(Paragraph(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}", body_style))
     story.append(Spacer(1, 12))
     
-    # 1. Sample Reference Data Field Outputs Table
     story.append(Paragraph("1. Sample Reference & Metadata", h2_style))
     meta_table_data = [
         [
@@ -349,7 +406,6 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
     story.append(t_meta)
     story.append(Spacer(1, 14))
 
-    # 2. Mix Proportions Table
     story.append(Paragraph("2. Reconstructed Concrete Mix Design (per 1 m³)", h2_style))
     
     col_names = ["Constituent", "Mass (kg/m³)", "Mass % (wt%)", "Vol (L/m³)", "Vol %", "Proportion (1:X)"]
@@ -377,7 +433,6 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
     story.append(t_mix)
     story.append(Spacer(1, 14))
 
-    # 3. Graphical Stacked Chart (Embedded Vector Drawing)
     story.append(Paragraph("3. Concrete Mix Composition (100% Mass Distribution Graphic)", h2_style))
     
     draw_w, draw_h = 520, 48
@@ -402,7 +457,6 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
                 d.add(String(cur_x + 4, bar_y + 8, f"{label}: {pct:.1f}%", fontName="Helvetica-Bold", fontSize=8, fillColor=colors.white))
             cur_x += seg_w
             
-    # Legend underneath
     d.add(Rect(0, 4, 10, 10, fillColor=colors.HexColor('#3366cc'), strokeColor=None))
     d.add(String(14, 6, "Binder", fontName="Helvetica", fontSize=8))
     
@@ -418,7 +472,6 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
     story.append(d)
     story.append(Spacer(1, 16))
 
-    # 4. Engineering Estimations (Strength & Slump)
     story.append(Paragraph("4. Estimated Engineering Performance", h2_style))
     perf_data = [
         [
@@ -451,7 +504,6 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
     doc.build(story)
     buffer.seek(0)
     return buffer.getvalue()
-
 
 # ---------------------------------------------------------
 # MAIN TAB NAVIGATION
@@ -602,7 +654,6 @@ with main_tab1:
         summary["Modal_Percent (%)"] = summary["Modal_Percent (%)"].round(2)
         summary["Std_Error (%)"] = summary["Std_Error (%)"].round(2)
 
-        # Store in session state for cross-module concrete mix design calculations
         st.session_state["active_sample_id"] = sample_id
         st.session_state["active_summary"] = summary.copy()
         st.session_state["active_job_number"] = job_number
@@ -612,7 +663,7 @@ with main_tab1:
         col_tbl, col_chart = st.columns([1.2, 1])
         with col_tbl:
             st.write("##### Phase Modal Percentage Table")
-            st.dataframe(summary, use_container_width=True)
+            st.dataframe(summary, width="stretch")
 
         with col_chart:
             st.write("##### Modal Composition Chart")
@@ -620,9 +671,9 @@ with main_tab1:
                 summary, x="Standardized_Phase", y="Modal_Percent (%)", 
                 text="Modal_Percent (%)", color="Standardized_Phase"
             )
-            st.plotly_chart(fig_bar, use_container_width=True)
+            st.plotly_chart(fig_bar, width="stretch")
 
-        # QAPF Ternary Plot (Rock & Aggregates)
+        # QAPF Ternary Plot
         if sample_type in ["Rock", "Aggregates"]:
             st.markdown("---")
             st.subheader("🔺 QAPF Ternary Classification")
@@ -654,7 +705,7 @@ with main_tab1:
                     },
                     'title': 'Q-A-P Ternary Plot'
                 })
-                st.plotly_chart(fig_ternary, use_container_width=True)
+                st.plotly_chart(fig_ternary, width="stretch")
 
         # Concrete I.S. 465 Aggregate Derivations
         if sample_type == "Concrete - I.S.465":
@@ -701,7 +752,7 @@ with main_tab1:
                 summary["Weight_Percent (%)"] = (mass_factor / mass_factor.sum()) * 100
                 summary["Weight_Percent (%)"] = summary["Weight_Percent (%)"].round(2)
 
-                st.dataframe(summary[["Standardized_Phase", "Point_Count", "Modal_Percent (%)", "Density (g/cm³)", "Weight_Percent (%)"]], use_container_width=True)
+                st.dataframe(summary[["Standardized_Phase", "Point_Count", "Modal_Percent (%)", "Density (g/cm³)", "Weight_Percent (%)"]], width="stretch")
 
             with agg_tab2:
                 asr_risk, asr_desc = evaluate_asr_risk(summary)
@@ -720,7 +771,7 @@ with main_tab1:
                 title="Spatial Point Distribution Across Thin Section (μm)"
             )
             fig_scatter.update_yaxes(autorange="reversed")
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            st.plotly_chart(fig_scatter, width="stretch")
 
         with c_index:
             st.write("##### Spatial Dispersion Coefficient")
@@ -751,7 +802,7 @@ with main_tab1:
             
             if sample_type == "Aggregate - Recycled" and tagging_data:
                 tag_df = pd.DataFrame.from_dict(tagging_data, orient='index').reset_index()
-                tag_df.rename(columns={'index': 'Standardized_Phase'}, inplace=True)
+                tag_df = tag_df.rename(columns={'index': 'Standardized_Phase'})
                 summary = summary.merge(tag_df, on="Standardized_Phase", how="left")
                 
             save_sample_to_db(meta_payload, summary)
@@ -802,7 +853,7 @@ with main_tab2:
             df_details["wt_percent"] = df_details["wt_percent"].round(2)
             
             st.write("##### Updated Modal & Weight Percentage Table")
-            st.dataframe(df_details[["phase_name", "point_count", "modal_percent", "density_gcm3", "wt_percent", "abundance"]], use_container_width=True)
+            st.dataframe(df_details[["phase_name", "point_count", "modal_percent", "density_gcm3", "wt_percent", "abundance"]], width="stretch")
 
             # Re-evaluate BS 8500 ASR Risk
             df_details_eval = df_details.rename(columns={"phase_name": "Standardized_Phase", "modal_percent": "Modal_Percent (%)"})
@@ -824,7 +875,7 @@ with main_tab2:
                     "lithology_code": sample_row.get("lithology_code", "")
                 }
                 
-                df_details.rename(columns={
+                df_details_to_save = df_details.rename(columns={
                     "phase_name": "Standardized_Phase",
                     "point_count": "Point_Count",
                     "modal_percent": "Modal_Percent (%)",
@@ -835,9 +886,9 @@ with main_tab2:
                     "en933_class": "EN933_Class",
                     "carbonation": "Carbonation",
                     "liberation": "Liberation"
-                }, inplace=True)
+                })
                 
-                save_sample_to_db(meta_update, df_details)
+                save_sample_to_db(meta_update, df_details_to_save)
                 st.success(f"Sample '{selected_db_id}' updated in database with new density & wt% calculations!")
     else:
         st.info("No saved samples available in the database to edit yet.")
@@ -860,7 +911,7 @@ with main_tab3:
     if mix_source == "Active Session Point Count":
         if "active_summary" in st.session_state and not st.session_state["active_summary"].empty:
             df_mix_input = st.session_state["active_summary"].copy()
-            df_mix_input.rename(columns={"Standardized_Phase": "Phase", "Modal_Percent (%)": "Vol_Pct"}, inplace=True)
+            df_mix_input = df_mix_input.rename(columns={"Standardized_Phase": "Phase", "Modal_Percent (%)": "Vol_Pct"})
             mix_sample_label = st.session_state.get("active_sample_id", "Active Sample")
             cur_job_num = st.session_state.get("active_job_number", "JOB-2026-001")
             cur_sample_ord = st.session_state.get("active_sample_order", "1")
@@ -1045,7 +1096,7 @@ with main_tab3:
 
         col_res1, col_res2 = st.columns([1.6, 1])
         with col_res1:
-            st.dataframe(df_mix_res, use_container_width=True)
+            st.dataframe(df_mix_res, width="stretch")
 
         with col_res2:
             st.metric("Total Fresh Density", f"{fresh_density:.0f} kg/m³")
@@ -1081,7 +1132,7 @@ with main_tab3:
             )
             fig_mass.update_traces(texttemplate='%{text:.1f}%', textposition='inside')
             fig_mass.update_layout(xaxis=dict(ticksuffix="%", range=[0, 100]), yaxis_title=None, height=260)
-            st.plotly_chart(fig_mass, use_container_width=True)
+            st.plotly_chart(fig_mass, width="stretch")
 
         with col_chart_v:
             df_stacked_vol = pd.DataFrame([
@@ -1105,7 +1156,7 @@ with main_tab3:
             )
             fig_vol.update_traces(texttemplate='%{text:.1f}%', textposition='inside')
             fig_vol.update_layout(xaxis=dict(ticksuffix="%", range=[0, 100]), yaxis_title=None, height=260)
-            st.plotly_chart(fig_vol, use_container_width=True)
+            st.plotly_chart(fig_vol, width="stretch")
 
         # ---------------------------------------------------------
         # 4. PERFORMANCE & PROPERTY ESTIMATION
@@ -1276,7 +1327,7 @@ with main_tab4:
         comp_type = st.selectbox("Select Sample Type to Compare", df_samples["sample_type"].unique(), key="comp_type_sel")
         filtered_s = df_samples[df_samples["sample_type"] == comp_type]
         st.write(f"Found **{len(filtered_s)}** samples for type: **{comp_type}**")
-        st.dataframe(filtered_s, use_container_width=True)
+        st.dataframe(filtered_s, width="stretch")
         st.caption("⚙️ Multi-sample trend plots, ternary compilation diagrams, and aggregate variability tables will render here.")
     else:
         st.info("No saved database samples available.")
@@ -1300,13 +1351,13 @@ with main_tab6:
     df_history = load_all_samples()
     
     if not df_history.empty:
-        st.dataframe(df_history, use_container_width=True)
+        st.dataframe(df_history, width="stretch")
         
         selected_sample = st.selectbox("Select Sample to View Modal Breakdown", df_history["sample_id"].unique(), key="hist_db_sel")
         if selected_sample:
             df_modal_history = load_sample_details(selected_sample)
             st.write(f"##### Modal Breakdown for: **{selected_sample}**")
-            st.dataframe(df_modal_history, use_container_width=True)
+            st.dataframe(df_modal_history, width="stretch")
     else:
         st.info("No saved samples found in the local database yet.")
         
