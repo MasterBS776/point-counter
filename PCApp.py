@@ -778,5 +778,5 @@ with main_tab3:
 
         # APPROACH A: Powers-Brownyard Hydration Stoichiometry
         v_c0_pct = v_paste / (1.0 + wb_ratio * (rho_cement / rho_water))
-        c_kg_a = 1000.0 * (v_c0_pct / 100.0
+        c_kg_a = 1000.0 * (v_c0_pct / 100.0) * rho_cement
         
