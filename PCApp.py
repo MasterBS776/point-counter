@@ -1,10 +1,19 @@
 import sqlite3
+import io
+import datetime
 import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from scipy.spatial.distance import cdist  # Replaces distance_matrix to avoid SciPy deprecation warnings
+from scipy.spatial.distance import cdist
+
+# ReportLab imports for direct in-memory PDF generation
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.graphics.shapes import Drawing, Rect, String, Line
 
 st.set_page_config(page_title="Geological Petrography QC & Analysis", layout="wide")
 
@@ -262,6 +271,189 @@ def calculate_spatial_index(df_points):
     return R, desc
 
 # ---------------------------------------------------------
+# PDF REPORT GENERATOR HELPER FUNCTION (REPORTLAB)
+# ---------------------------------------------------------
+def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, mass_pcts):
+    """Generates an executive concrete mix design PDF report with embedded table and chart."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36
+    )
+    
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'DocTitle',
+        parent=styles['Heading1'],
+        fontName='Helvetica-Bold',
+        fontSize=18,
+        leading=22,
+        textColor=colors.HexColor('#1b365d')
+    )
+    h2_style = ParagraphStyle(
+        'Heading2',
+        parent=styles['Heading2'],
+        fontName='Helvetica-Bold',
+        fontSize=12,
+        leading=16,
+        textColor=colors.HexColor('#1b365d')
+    )
+    body_style = ParagraphStyle(
+        'Body',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=9,
+        leading=12
+    )
+    bold_style = ParagraphStyle(
+        'BoldBody',
+        parent=body_style,
+        fontName='Helvetica-Bold'
+    )
+    
+    story = []
+    
+    # Title & Header
+    story.append(Paragraph("Concrete Mix Reverse-Engineering & Petrographic Report", title_style))
+    story.append(Paragraph(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}", body_style))
+    story.append(Spacer(1, 12))
+    
+    # 1. Sample Reference Data Field Outputs Table
+    story.append(Paragraph("1. Sample Reference & Metadata", h2_style))
+    meta_table_data = [
+        [
+            Paragraph("<b>Job Number:</b>", body_style), Paragraph(str(meta_dict.get("job_number", "N/A")), body_style),
+            Paragraph("<b>Sample ID:</b>", body_style), Paragraph(str(meta_dict.get("sample_id", "N/A")), body_style)
+        ],
+        [
+            Paragraph("<b>Sample Order:</b>", body_style), Paragraph(str(meta_dict.get("sample_order", "1")), body_style),
+            Paragraph("<b>Operator:</b>", body_style), Paragraph(str(meta_dict.get("operator", "N/A")), body_style)
+        ],
+        [
+            Paragraph("<b>Calculation Approach:</b>", body_style), Paragraph(str(meta_dict.get("approach", "Approach B")), body_style),
+            Paragraph("<b>Est. w/b Ratio:</b>", body_style), Paragraph(f"{meta_dict.get('wb_ratio', 0.48):.2f}", body_style)
+        ]
+    ]
+    t_meta = Table(meta_table_data, colWidths=[110, 150, 110, 150])
+    t_meta.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#f4f7fb')),
+        ('BOX', (0,0), (-1,-1), 1, colors.HexColor('#d0d7de')),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('TOPPADDING', (0,0), (-1,-1), 5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+    ]))
+    story.append(t_meta)
+    story.append(Spacer(1, 14))
+
+    # 2. Mix Proportions Table
+    story.append(Paragraph("2. Reconstructed Concrete Mix Design (per 1 m³)", h2_style))
+    
+    col_names = ["Constituent", "Mass (kg/m³)", "Mass % (wt%)", "Vol (L/m³)", "Vol %", "Proportion (1:X)"]
+    table_data = [[Paragraph(f"<b>{h}</b>", bold_style) for h in col_names]]
+    
+    for _, r in df_results.iterrows():
+        table_data.append([
+            Paragraph(str(r["Constituent"]), body_style),
+            Paragraph(str(r["Batch Weight (kg/m³)"]), body_style),
+            Paragraph(str(r["Determined Mass % (wt%)"]), body_style),
+            Paragraph(str(r["Batch Volume (L/m³)"]), body_style),
+            Paragraph(str(r["Determined Vol %"]), body_style),
+            Paragraph(str(r["Mix Proportion (1 : X)"]), body_style),
+        ])
+        
+    t_mix = Table(table_data, colWidths=[130, 75, 75, 75, 70, 95])
+    t_mix.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1b365d')),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#d0d7de')),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#f8f9fa')]),
+        ('TOPPADDING', (0,0), (-1,-1), 4),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+    ]))
+    story.append(t_mix)
+    story.append(Spacer(1, 14))
+
+    # 3. Graphical Stacked Chart (Embedded Vector Drawing)
+    story.append(Paragraph("3. Concrete Mix Composition (100% Mass Distribution Graphic)", h2_style))
+    
+    draw_w, draw_h = 520, 48
+    d = Drawing(draw_w, draw_h)
+    
+    c_map = [
+        ("Binder", mass_pcts.get("Binder", 0), colors.HexColor('#3366cc')),
+        ("Water", mass_pcts.get("Water", 0), colors.HexColor('#22aa99')),
+        ("Fine Agg", mass_pcts.get("Fine Agg", 0), colors.HexColor('#ff9900')),
+        ("Coarse Agg", mass_pcts.get("Coarse Agg", 0), colors.HexColor('#dc3912'))
+    ]
+    
+    cur_x = 0
+    bar_y = 20
+    bar_h = 24
+    
+    for label, pct, col in c_map:
+        seg_w = (pct / 100.0) * draw_w
+        if seg_w > 0:
+            d.add(Rect(cur_x, bar_y, seg_w, bar_h, fillColor=col, strokeColor=colors.white, strokeWidth=1))
+            if seg_w > 38:
+                d.add(String(cur_x + 4, bar_y + 8, f"{label}: {pct:.1f}%", fontName="Helvetica-Bold", fontSize=8, fillColor=colors.white))
+            cur_x += seg_w
+            
+    # Legend underneath
+    d.add(Rect(0, 4, 10, 10, fillColor=colors.HexColor('#3366cc'), strokeColor=None))
+    d.add(String(14, 6, "Binder", fontName="Helvetica", fontSize=8))
+    
+    d.add(Rect(70, 4, 10, 10, fillColor=colors.HexColor('#22aa99'), strokeColor=None))
+    d.add(String(84, 6, "Water", fontName="Helvetica", fontSize=8))
+    
+    d.add(Rect(140, 4, 10, 10, fillColor=colors.HexColor('#ff9900'), strokeColor=None))
+    d.add(String(154, 6, "Fine Aggregate", fontName="Helvetica", fontSize=8))
+    
+    d.add(Rect(235, 4, 10, 10, fillColor=colors.HexColor('#dc3912'), strokeColor=None))
+    d.add(String(249, 6, "Coarse Aggregate", fontName="Helvetica", fontSize=8))
+    
+    story.append(d)
+    story.append(Spacer(1, 16))
+
+    # 4. Engineering Estimations (Strength & Slump)
+    story.append(Paragraph("4. Estimated Engineering Performance", h2_style))
+    perf_data = [
+        [
+            Paragraph("<b>Estimated 28-Day Cube Strength (fcu,28):</b>", bold_style),
+            Paragraph(f"<b>{strength_dict.get('strength', 0.0):.1f} MPa</b> (95% CI: {strength_dict.get('ci_low', 0.0):.1f} – {strength_dict.get('ci_high', 0.0):.1f} MPa)", body_style)
+        ],
+        [
+            Paragraph("<b>Air Void Strength Penalty:</b>", body_style),
+            Paragraph(f"{strength_dict.get('air_penalty', 0.0):.1f}% reduction (Air Void content: {strength_dict.get('air_pct', 0.0):.1f}%)", body_style)
+        ],
+        [
+            Paragraph("<b>Estimated Fresh Slump:</b>", bold_style),
+            Paragraph(f"<b>{slump_dict.get('slump', 0.0):.0f} mm</b> ({slump_dict.get('class', 'N/A')})", body_style)
+        ],
+        [
+            Paragraph("<b>Total Fresh Density:</b>", body_style),
+            Paragraph(f"{meta_dict.get('fresh_density', 0.0):.0f} kg/m³", body_style)
+        ]
+    ]
+    t_perf = Table(perf_data, colWidths=[200, 320])
+    t_perf.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#fbfcfd')),
+        ('BOX', (0,0), (-1,-1), 1, colors.HexColor('#d0d7de')),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#e1e4e8')),
+        ('TOPPADDING', (0,0), (-1,-1), 5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+    ]))
+    story.append(t_perf)
+    
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ---------------------------------------------------------
 # MAIN TAB NAVIGATION
 # ---------------------------------------------------------
 main_tab1, main_tab2, main_tab3, main_tab4, main_tab5, main_tab6 = st.tabs([
@@ -413,6 +605,9 @@ with main_tab1:
         # Store in session state for cross-module concrete mix design calculations
         st.session_state["active_sample_id"] = sample_id
         st.session_state["active_summary"] = summary.copy()
+        st.session_state["active_job_number"] = job_number
+        st.session_state["active_sample_order"] = sample_order
+        st.session_state["active_operator"] = operator
 
         col_tbl, col_chart = st.columns([1.2, 1])
         with col_tbl:
@@ -650,9 +845,6 @@ with main_tab2:
 # =========================================================
 # TAB 3: CONCRETE MIX DESIGN ENGINE (APPROACH B & A)
 # =========================================================
-# =========================================================
-# TAB 3: CONCRETE MIX DESIGN ENGINE (APPROACH B & A)
-# =========================================================
 with main_tab3:
     st.header("🏗️ Hardened Concrete Mix Reverse-Engineering & Performance Engine")
     st.info("Back-calculate original concrete mix proportions ($1\\text{ m}^3$), 28-day cube strength (UK DoE 1B), and fresh slump using stereological modal points.")
@@ -661,12 +853,18 @@ with main_tab3:
 
     df_mix_input = pd.DataFrame()
     mix_sample_label = "Unassigned"
+    cur_job_num = "JOB-2026-001"
+    cur_sample_ord = "1"
+    cur_op_name = "Analyst"
 
     if mix_source == "Active Session Point Count":
         if "active_summary" in st.session_state and not st.session_state["active_summary"].empty:
             df_mix_input = st.session_state["active_summary"].copy()
             df_mix_input.rename(columns={"Standardized_Phase": "Phase", "Modal_Percent (%)": "Vol_Pct"}, inplace=True)
             mix_sample_label = st.session_state.get("active_sample_id", "Active Sample")
+            cur_job_num = st.session_state.get("active_job_number", "JOB-2026-001")
+            cur_sample_ord = st.session_state.get("active_sample_order", "1")
+            cur_op_name = st.session_state.get("active_operator", "Analyst")
             st.success(f"Loaded active point count data for: **{mix_sample_label}**")
         else:
             st.warning("No active sample point count found in Tab 1. Upload a sample or choose 'Load Sample from Database'.")
@@ -676,9 +874,13 @@ with main_tab3:
             concrete_db = df_all_db[df_all_db["sample_type"].str.contains("Concrete", case=False)]
             if not concrete_db.empty:
                 sel_db_mix = st.selectbox("Select Concrete Sample from Database:", concrete_db["sample_id"].unique(), key="sel_mix_db")
+                db_row = concrete_db[concrete_db["sample_id"] == sel_db_mix].iloc[0]
                 df_modal_db = load_sample_details(sel_db_mix)
                 df_mix_input = df_modal_db.rename(columns={"phase_name": "Phase", "modal_percent": "Vol_Pct"}).copy()
                 mix_sample_label = sel_db_mix
+                cur_job_num = db_row["job_number"]
+                cur_sample_ord = db_row["sample_order"]
+                cur_op_name = db_row["operator"]
                 st.success(f"Loaded database point count data for: **{mix_sample_label}**")
             else:
                 st.warning("No samples categorized as 'Concrete' found in the database.")
@@ -766,13 +968,12 @@ with main_tab3:
             rho_coarse = float(d_col3.number_input("Coarse Agg Density (g/cm³)", value=2.68, step=0.01))
 
         # ---------------------------------------------------------
-        # MIX RECONSTRUCTION CALCULATIONS (CORRECTED UNIT SCALING)
+        # MIX RECONSTRUCTION CALCULATIONS
         # ---------------------------------------------------------
         rho_water = 1.00  # g/cm³ (= 1000 kg/m³ or 1.0 kg/L)
         v_total_agg = v_fine + v_coarse
 
         # APPROACH B: Absolute Volume Conservation (BS 1881-124)
-        # Volume available for fresh paste in 1 m³:
         v_paste_avail_m3 = max(0.05, 1.0 - ((v_total_agg + v_void) / 100.0))
         denom_b = (1.0 / (rho_cement * 1000.0)) + (wb_ratio / (rho_water * 1000.0))
         c_kg_b = v_paste_avail_m3 / denom_b
@@ -797,6 +998,27 @@ with main_tab3:
         coarse_kg = coarse_kg_b if is_approach_b else coarse_kg_a
         fresh_density = fresh_density_b if is_approach_b else fresh_density_a
 
+        # Batch Volumes (L/m³)
+        v_c_L = c_kg / rho_cement
+        v_w_L = w_kg / rho_water
+        v_fine_L = fine_kg / rho_fine
+        v_coarse_L = coarse_kg / rho_coarse
+        v_air_L = v_void * 10.0
+        total_batch_vol_L = v_c_L + v_w_L + v_fine_L + v_coarse_L + v_air_L
+
+        # Determined Mass % (wt%) & Volumetric % Content
+        c_wt_pct = (c_kg / fresh_density) * 100.0 if fresh_density > 0 else 0.0
+        w_wt_pct = (w_kg / fresh_density) * 100.0 if fresh_density > 0 else 0.0
+        fine_wt_pct = (fine_kg / fresh_density) * 100.0 if fresh_density > 0 else 0.0
+        coarse_wt_pct = (coarse_kg / fresh_density) * 100.0 if fresh_density > 0 else 0.0
+        total_agg_wt_pct = fine_wt_pct + coarse_wt_pct
+
+        c_vol_pct = (v_c_L / total_batch_vol_L) * 100.0 if total_batch_vol_L > 0 else 0.0
+        w_vol_pct = (v_w_L / total_batch_vol_L) * 100.0 if total_batch_vol_L > 0 else 0.0
+        fine_vol_pct = (v_fine_L / total_batch_vol_L) * 100.0 if total_batch_vol_L > 0 else 0.0
+        coarse_vol_pct = (v_coarse_L / total_batch_vol_L) * 100.0 if total_batch_vol_L > 0 else 0.0
+        air_vol_pct = (v_air_L / total_batch_vol_L) * 100.0 if total_batch_vol_L > 0 else 0.0
+
         # Mix Proportions 1 : X
         prop_c = 1.0
         prop_fine = fine_kg / c_kg if c_kg > 0 else 0.0
@@ -804,24 +1026,14 @@ with main_tab3:
         total_agg_ratio = prop_fine + prop_coarse
 
         st.markdown("---")
-        st.subheader("3. Reconstructed Mix Proportions (per 1 m³ Batch)")
+        st.subheader("3. Reconstructed Mix Proportions & Determined Content")
 
         df_mix_res = pd.DataFrame({
             "Constituent": ["Binder (Cementitious)", "Water", "Fine Aggregate", "Coarse Aggregate", "Air Voids"],
-            "Batch Weight (kg/m³)": [
-                f"{c_kg:.1f}", 
-                f"{w_kg:.1f}", 
-                f"{fine_kg:.1f}", 
-                f"{coarse_kg:.1f}", 
-                "0.0"
-            ],
-            "Batch Volume (L/m³)": [
-                f"{(c_kg / rho_cement):.1f}",
-                f"{(w_kg / rho_water):.1f}",
-                f"{(fine_kg / rho_fine):.1f}",
-                f"{(coarse_kg / rho_coarse):.1f}",
-                f"{(v_void * 10.0):.1f}"
-            ],
+            "Batch Weight (kg/m³)": [f"{c_kg:.1f}", f"{w_kg:.1f}", f"{fine_kg:.1f}", f"{coarse_kg:.1f}", "0.0"],
+            "Determined Mass % (wt%)": [f"{c_wt_pct:.1f}%", f"{w_wt_pct:.1f}%", f"{fine_wt_pct:.1f}%", f"{coarse_wt_pct:.1f}%", "0.0%"],
+            "Batch Volume (L/m³)": [f"{v_c_L:.1f}", f"{v_w_L:.1f}", f"{v_fine_L:.1f}", f"{v_coarse_L:.1f}", f"{v_air_L:.1f}"],
+            "Determined Vol %": [f"{c_vol_pct:.1f}%", f"{w_vol_pct:.1f}%", f"{fine_vol_pct:.1f}%", f"{coarse_vol_pct:.1f}%", f"{air_vol_pct:.1f}%"],
             "Mix Proportion (1 : X)": [
                 "1.00",
                 f"{wb_ratio:.2f} (w/b)",
@@ -831,21 +1043,69 @@ with main_tab3:
             ]
         })
 
-        col_res1, col_res2 = st.columns([1.5, 1])
+        col_res1, col_res2 = st.columns([1.6, 1])
         with col_res1:
             st.dataframe(df_mix_res, use_container_width=True)
 
         with col_res2:
             st.metric("Total Fresh Density", f"{fresh_density:.0f} kg/m³")
-            st.metric("Paste-to-Aggregate Volume Ratio", f"{(v_paste / v_total_agg):.2f}" if v_total_agg > 0 else "N/A")
-            st.metric("Total Aggregate-to-Binder Ratio", f"1 : {total_agg_ratio:.2f}")
+            st.metric("Total Aggregate Content", f"{total_agg_wt_pct:.1f} wt% ({v_total_agg:.1f} vol%)")
+            st.metric("Binder Content", f"{c_wt_pct:.1f} wt% ({c_kg:.0f} kg/m³)")
+            st.metric("Water Content", f"{w_wt_pct:.1f} wt% ({w_kg:.0f} kg/m³)")
 
-        if not is_approach_b:
-            delta_c = c_kg_a - c_kg_b
-            st.caption(f"ℹ️ **Comparison vs Mass Balance (Approach B):** Binder variance is **{delta_c:+.1f} kg/m³**.")
-        else:
-            delta_c = c_kg_b - c_kg_a
-            st.caption(f"ℹ️ **Comparison vs Powers-Brownyard (Approach A):** Binder variance is **{delta_c:+.1f} kg/m³**.")
+        # ---------------------------------------------------------
+        # GRAPHICAL 100% STACKED BAR CHARTS
+        # ---------------------------------------------------------
+        st.markdown("---")
+        st.subheader("📊 Mix Design Composition Visualisation")
+
+        col_chart_m, col_chart_v = st.columns(2)
+
+        with col_chart_m:
+            df_stacked_mass = pd.DataFrame([
+                {"Category": "Total Mass %", "Constituent": "Binder (Cement)", "Percentage": c_wt_pct},
+                {"Category": "Total Mass %", "Constituent": "Water", "Percentage": w_wt_pct},
+                {"Category": "Total Mass %", "Constituent": "Fine Aggregate", "Percentage": fine_wt_pct},
+                {"Category": "Total Mass %", "Constituent": "Coarse Aggregate", "Percentage": coarse_wt_pct}
+            ])
+            fig_mass = px.bar(
+                df_stacked_mass, y="Category", x="Percentage", color="Constituent",
+                orientation='h', barmode='stack', text="Percentage",
+                title="100% Stacked Chart: Batch Mass (wt%)",
+                color_discrete_map={
+                    "Binder (Cement)": "#3366cc",
+                    "Water": "#22aa99",
+                    "Fine Aggregate": "#ff9900",
+                    "Coarse Aggregate": "#dc3912"
+                }
+            )
+            fig_mass.update_traces(texttemplate='%{text:.1f}%', textposition='inside')
+            fig_mass.update_layout(xaxis=dict(ticksuffix="%", range=[0, 100]), yaxis_title=None, height=260)
+            st.plotly_chart(fig_mass, use_container_width=True)
+
+        with col_chart_v:
+            df_stacked_vol = pd.DataFrame([
+                {"Category": "Total Vol %", "Constituent": "Binder", "Percentage": c_vol_pct},
+                {"Category": "Total Vol %", "Constituent": "Water", "Percentage": w_vol_pct},
+                {"Category": "Total Vol %", "Constituent": "Fine Aggregate", "Percentage": fine_vol_pct},
+                {"Category": "Total Vol %", "Constituent": "Coarse Aggregate", "Percentage": coarse_vol_pct},
+                {"Category": "Total Vol %", "Constituent": "Air Voids", "Percentage": air_vol_pct}
+            ])
+            fig_vol = px.bar(
+                df_stacked_vol, y="Category", x="Percentage", color="Constituent",
+                orientation='h', barmode='stack', text="Percentage",
+                title="100% Stacked Chart: Volumetric Distribution (vol%)",
+                color_discrete_map={
+                    "Binder": "#3366cc",
+                    "Water": "#22aa99",
+                    "Fine Aggregate": "#ff9900",
+                    "Coarse Aggregate": "#dc3912",
+                    "Air Voids": "#999999"
+                }
+            )
+            fig_vol.update_traces(texttemplate='%{text:.1f}%', textposition='inside')
+            fig_vol.update_layout(xaxis=dict(ticksuffix="%", range=[0, 100]), yaxis_title=None, height=260)
+            st.plotly_chart(fig_vol, use_container_width=True)
 
         # ---------------------------------------------------------
         # 4. PERFORMANCE & PROPERTY ESTIMATION
@@ -879,11 +1139,11 @@ with main_tab3:
             air_excess = max(0.0, v_void - 1.0)
             air_penalty_factor = max(0.50, 1.0 - (0.055 * air_excess))
             final_fcu_28 = max(5.0, calc_fcu_28 * air_penalty_factor)
+            ci_low = max(5.0, final_fcu_28 - 4.5)
+            ci_high = final_fcu_28 + 4.5
 
             with s_col2:
                 st.metric("Estimated 28-Day Cube Strength (fcu, 28)", f"{final_fcu_28:.1f} MPa")
-                ci_low = max(5.0, final_fcu_28 - 4.5)
-                ci_high = final_fcu_28 + 4.5
                 st.info(f"**95% Confidence Interval:** {ci_low:.1f} – {ci_high:.1f} MPa\n\n*Applied Air Void Penalty:* {((1.0 - air_penalty_factor)*100):.1f}% reduction due to {v_void:.1f}% voids.")
 
         with p_tab2:
@@ -948,4 +1208,105 @@ with main_tab3:
             with w_col2:
                 st.metric("Estimated Fresh Slump", f"{est_slump_clamped:.0f} mm")
                 st.info(f"**Workability Class:** {slump_class}\n\n*Reference Water Demand:* {effective_target_water:.1f} kg/m³ vs *Actual Reconstructed:* {w_kg:.1f} kg/m³.")
-                
+
+        # ---------------------------------------------------------
+        # 5. PDF REPORT EXPORT SECTION
+        # ---------------------------------------------------------
+        st.markdown("---")
+        st.subheader("📑 5. Export Mix Design Report (PDF)")
+        
+        pdf_meta = {
+            "sample_id": mix_sample_label,
+            "job_number": cur_job_num,
+            "sample_order": cur_sample_ord,
+            "operator": cur_op_name,
+            "approach": "Approach B (Mass Balance BS 1881-124)" if is_approach_b else "Approach A (Powers-Brownyard)",
+            "wb_ratio": wb_ratio,
+            "fresh_density": fresh_density
+        }
+        
+        pdf_strength = {
+            "strength": final_fcu_28,
+            "ci_low": ci_low,
+            "ci_high": ci_high,
+            "air_penalty": (1.0 - air_penalty_factor) * 100.0,
+            "air_pct": v_void
+        }
+        
+        pdf_slump = {
+            "slump": est_slump_clamped,
+            "class": slump_class
+        }
+        
+        pdf_mass_pcts = {
+            "Binder": c_wt_pct,
+            "Water": w_wt_pct,
+            "Fine Agg": fine_wt_pct,
+            "Coarse Agg": coarse_wt_pct
+        }
+        
+        try:
+            pdf_bytes = generate_mix_design_pdf(
+                meta_dict=pdf_meta,
+                df_results=df_mix_res,
+                strength_dict=pdf_strength,
+                slump_dict=pdf_slump,
+                mass_pcts=pdf_mass_pcts
+            )
+            
+            st.download_button(
+                label="📥 Download Concrete Mix Design Report (PDF)",
+                data=pdf_bytes,
+                file_name=f"{cur_job_num}_{mix_sample_label}_mix_design_report.pdf",
+                mime="application/pdf",
+                type="primary"
+            )
+        except Exception as e:
+            st.error(f"Error generating PDF report: {e}")
+
+# =========================================================
+# TAB 4: MULTI-SAMPLE COMPARISON PLACEHOLDER
+# =========================================================
+with main_tab4:
+    st.header("📊 Multi-Sample Comparative Analysis Dashboard")
+    st.info("Compare petrographic results across multiple samples of the same sample type.")
+    
+    df_samples = load_all_samples()
+    if not df_samples.empty:
+        comp_type = st.selectbox("Select Sample Type to Compare", df_samples["sample_type"].unique(), key="comp_type_sel")
+        filtered_s = df_samples[df_samples["sample_type"] == comp_type]
+        st.write(f"Found **{len(filtered_s)}** samples for type: **{comp_type}**")
+        st.dataframe(filtered_s, use_container_width=True)
+        st.caption("⚙️ Multi-sample trend plots, ternary compilation diagrams, and aggregate variability tables will render here.")
+    else:
+        st.info("No saved database samples available.")
+
+# =========================================================
+# TAB 5: GEOLOGICAL DRIVE RESOURCES PLACEHOLDER
+# =========================================================
+with main_tab5:
+    st.header("🌐 Geological Google Drive Resources")
+    st.info("Connect to Google Drive hosted geological manuals, thin section reference atlases, and standards.")
+    
+    st.text_input("Google Drive Folder ID / Share Link", value="https://drive.google.com/drive/folders/placeholder")
+    st.button("🔗 Connect to Google Workspace Drive")
+    st.caption("⚙️ PDF reference viewer and aggregate lithology optical reference photos will load here.")
+
+# =========================================================
+# TAB 6: LOCAL DATABASE BROWSER
+# =========================================================
+with main_tab6:
+    st.subheader("📁 Saved Geological Samples History")
+    df_history = load_all_samples()
+    
+    if not df_history.empty:
+        st.dataframe(df_history, use_container_width=True)
+        
+        selected_sample = st.selectbox("Select Sample to View Modal Breakdown", df_history["sample_id"].unique(), key="hist_db_sel")
+        if selected_sample:
+            df_modal_history = load_sample_details(selected_sample)
+            st.write(f"##### Modal Breakdown for: **{selected_sample}**")
+            st.dataframe(df_modal_history, use_container_width=True)
+    else:
+        st.info("No saved samples found in the local database yet.")
+        
