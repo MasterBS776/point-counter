@@ -18,6 +18,46 @@ from reportlab.graphics.shapes import Drawing, Rect, String
 
 st.set_page_config(page_title="Geological Petrography QC & Analysis", layout="wide")
 
+# ---------------------------------------------------------
+# CUSTOM LABORATORY STYLING (CSS)
+# ---------------------------------------------------------
+st.markdown("""
+<style>
+    /* Metric & Bento Card styling */
+    .metric-card {
+        background-color: #f8f9fa;
+        border: 1px solid #e1e4e8;
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin-bottom: 12px;
+    }
+    .status-pill {
+        display: inline-block;
+        padding: 2px 10px;
+        border-radius: 12px;
+        font-size: 0.82rem;
+        font-weight: 600;
+    }
+    .pill-green { background-color: #d1e7dd; color: #0f5132; }
+    .pill-amber { background-color: #fff3cd; color: #664d03; }
+    .pill-red { background-color: #f8d7da; color: #842029; }
+    .pill-blue { background-color: #cfe2ff; color: #084298; }
+    
+    /* Top Context Bar */
+    .context-ribbon {
+        background: #1b365d;
+        color: #ffffff;
+        padding: 10px 18px;
+        border-radius: 6px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 16px;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 st.title("🔬 Geological Petrography Analysis Platform")
 
 SCALE_UM_PER_PX = 1.82  # 1.82 microns per pixel
@@ -30,7 +70,6 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # 1. Base Samples Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS samples (
             sample_id TEXT PRIMARY KEY,
@@ -52,7 +91,6 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
-    # 2. Base Modal Results Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS modal_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -406,7 +444,6 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
     story.append(Spacer(1, 14))
 
     story.append(Paragraph("2. Reconstructed Concrete Mix Design (per 1 m³)", h2_style))
-    
     col_names = ["Constituent", "Mass (kg/m³)", "Mass % (wt%)", "Vol (L/m³)", "Vol %", "Proportion (1:X)"]
     table_data = [[Paragraph(f"<b>{h}</b>", bold_style) for h in col_names]]
     
@@ -433,7 +470,6 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
     story.append(Spacer(1, 14))
 
     story.append(Paragraph("3. Concrete Mix Composition (100% Mass Distribution Graphic)", h2_style))
-    
     draw_w, draw_h = 520, 48
     d = Drawing(draw_w, draw_h)
     
@@ -458,13 +494,10 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
             
     d.add(Rect(0, 4, 10, 10, fillColor=colors.HexColor('#3366cc'), strokeColor=None))
     d.add(String(14, 6, "Binder", fontName="Helvetica", fontSize=8))
-    
     d.add(Rect(70, 4, 10, 10, fillColor=colors.HexColor('#22aa99'), strokeColor=None))
     d.add(String(84, 6, "Water", fontName="Helvetica", fontSize=8))
-    
     d.add(Rect(140, 4, 10, 10, fillColor=colors.HexColor('#ff9900'), strokeColor=None))
     d.add(String(154, 6, "Fine Aggregate", fontName="Helvetica", fontSize=8))
-    
     d.add(Rect(235, 4, 10, 10, fillColor=colors.HexColor('#dc3912'), strokeColor=None))
     d.add(String(249, 6, "Coarse Aggregate", fontName="Helvetica", fontSize=8))
     
@@ -505,6 +538,27 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
     return buffer.getvalue()
 
 # ---------------------------------------------------------
+# PERSISTENT LABORATORY CONTEXT BAR
+# ---------------------------------------------------------
+active_id = st.session_state.get("active_sample_id", "No Active Sample")
+active_job = st.session_state.get("active_job_number", "None")
+active_type = st.session_state.get("active_sample_type", "General")
+active_status = "Committed to DB" if st.session_state.get("is_db_committed", False) else "Session Draft"
+
+st.markdown(f"""
+<div class="context-ribbon">
+    <div>
+        <b>🔬 Active Sample:</b> <span style="font-size:1.05rem; color:#85bbf0;">{active_id}</span> &nbsp;|&nbsp; 
+        <b>Job:</b> {active_job} &nbsp;|&nbsp; 
+        <b>Material:</b> {active_type}
+    </div>
+    <div>
+        <span class="status-pill {'pill-green' if active_status == 'Committed to DB' else 'pill-amber'}">{active_status}</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------
 # MAIN TAB NAVIGATION
 # ---------------------------------------------------------
 main_tab1, main_tab2, main_tab3, main_tab4, main_tab5, main_tab6, main_tab7 = st.tabs([
@@ -518,13 +572,13 @@ main_tab1, main_tab2, main_tab3, main_tab4, main_tab5, main_tab6, main_tab7 = st
 ])
 
 # =========================================================
-# TAB 1: CURRENT SAMPLE ANALYSIS & DB RE-COMMIT
+# TAB 1: SPLIT-PANE POINT COUNT ANALYSIS & INGESTION
 # =========================================================
 with main_tab1:
-    st.sidebar.header("1. Sample Source & Job Metadata")
+    st.sidebar.header("1. Sample Source & Metadata")
     
     input_mode = st.sidebar.radio(
-        "Select Sample Ingestion Mode:",
+        "Ingestion Mode:",
         ["Upload New File (CSV/TSV)", "Load Existing Sample from DB"],
         help="Upload raw counter coordinates or load an already saved record to alter mappings and recommit."
     )
@@ -562,408 +616,314 @@ with main_tab1:
             sample_type = st.sidebar.selectbox("Sample Type", SAMPLE_TYPES, index=def_idx)
             operator = st.sidebar.text_input("Operator Name", value=str(existing_sample_data["operator"]))
             
-            # Load stored modal results
             df_modal_loaded = load_sample_details(sel_sample_id)
         else:
             st.sidebar.warning("Database has no records yet. Upload a file first.")
             st.info("👈 No database records found. Please switch to 'Upload New File (CSV/TSV)' in the sidebar.")
 
-    # ------------------ WORKFLOW EXECUTION ------------------
+    # ------------------ SPLIT PANE WORKFLOW ------------------
     if input_mode == "Upload New File (CSV/TSV)" and df_raw is not None:
-        st.subheader("📋 Step 1: Ingestion & Metadata Overview")
-        col1, col2, col3, col4 = st.columns(4)
-        sample_id = col1.text_input("Sample ID", value=str(df_raw["Image_File"].iloc[0]).split(".")[0])
-        col2.metric("Job Number", job_number)
-        col3.metric("Sample Order", sample_order)
-        col4.metric("Total Gross Points", len(df_raw))
-
-        litho_tag = ""
-        if sample_type == "Concrete - I.S.465":
-            litho_tag = st.selectbox("I.S. 465 Main Aggregate Lithology Tag (3-Letter Code)", IS465_LITHOLOGY_CODES)
-
-        st.markdown("---")
-        st.subheader("📐 Point Count Geometry & Traverse Metrics")
-
-        df_raw["X_um"] = df_raw["X"] * SCALE_UM_PER_PX
-        df_raw["Y_um"] = df_raw["Y"] * SCALE_UM_PER_PX
-
-        x_min_um, x_max_um = df_raw["X_um"].min(), df_raw["X_um"].max()
-        y_min_um, y_max_um = df_raw["Y_um"].min(), df_raw["Y_um"].max()
-
-        width_um = x_max_um - x_min_um
-        height_um = y_max_um - y_min_um
-        width_mm = width_um / 1000.0
-        height_mm = height_um / 1000.0
-        area_mm2 = width_mm * height_mm
-
-        unique_y = np.sort(df_raw["Y_um"].unique())
-        unique_x = np.sort(df_raw["X_um"].unique())
-
-        num_traverses = len(unique_y)
-        num_transects = len(unique_x)
-
-        x_spacing_um = np.mean(np.diff(unique_x)) if len(unique_x) > 1 else 0.0
-        y_spacing_um = np.mean(np.diff(unique_y)) if len(unique_y) > 1 else 0.0
-        total_linear_traverse_mm = num_traverses * width_mm
-
-        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-        m_col1.metric("X-Span (Width)", f"{width_mm:.2f} mm")
-        m_col2.metric("Y-Span (Height)", f"{height_mm:.2f} mm")
-        m_col3.metric("Bounding Area", f"{area_mm2:.2f} mm²")
-        m_col4.metric("Total Linear Traverse", f"{total_linear_traverse_mm:.2f} mm")
-
-        m_col5, m_col6, m_col7, m_col8 = st.columns(4)
-        m_col5.metric("Traverses (Rows)", num_traverses)
-        m_col6.metric("Transects (Cols)", num_transects)
-        m_col7.metric("X-Spacing", f"{x_spacing_um:.1f} μm")
-        m_col8.metric("Y-Spacing", f"{y_spacing_um:.1f} μm")
-
-        st.markdown("---")
-        st.subheader("🛠️ Step 2: Quality Control (QC) & Term Mapping")
+        left_pane, right_pane = st.columns([4, 6])
         
-        unique_terms = df_raw["Raw_Term"].unique().tolist()
-        lookup = DEFAULT_LOOKUPS.get(sample_type, {})
-        
-        mapping_dict = {}
-        qc_cols = st.columns(2)
-        
-        for idx, term in enumerate(unique_terms):
-            default_val = lookup.get(term, term)
-            with qc_cols[idx % 2]:
-                mapping_dict[term] = st.text_input(
-                    label=f"Raw Term: **{term}**", 
-                    value=default_val, 
-                    key=f"map_{term}"
-                )
-
-        df_mapped = df_raw.copy()
-        df_mapped["Standardized_Phase"] = df_mapped["Raw_Term"].map(mapping_dict)
-
-        df_valid = df_mapped[df_mapped["Standardized_Phase"].str.upper() != "NA"].copy()
-        valid_points_count = len(df_valid)
-        na_count = len(df_mapped) - valid_points_count
-
-        st.caption(f"ℹ️ **Exclusion Notice:** {na_count} 'NA' points excluded from modal calculations. Valid count: {valid_points_count}.")
-
-        tagging_data = {}
-        if sample_type == "Aggregate - Recycled":
-            st.markdown("---")
-            st.subheader("🏷️ Recycled Aggregate Phase Tagging (EN 933-11)")
+        with left_pane:
+            st.subheader("📋 Ingestion & Geometry")
+            sample_id = st.text_input("Sample ID", value=str(df_raw["Image_File"].iloc[0]).split(".")[0])
             
-            active_phases = df_valid["Standardized_Phase"].unique().tolist()
-            for phase in active_phases:
-                st.write(f"##### Phase: **{phase}**")
-                t_col1, t_col2, t_col3 = st.columns(3)
-                
-                en_class = t_col1.selectbox(f"EN933-11 Class ({phase})", EN933_11_CLASSES, key=f"en_{phase}")
-                carb_state = t_col2.selectbox(f"Carbonation ({phase})", CARBONATION_STATES, key=f"carb_{phase}")
-                lib_idx = t_col3.selectbox(f"Liberation Index ({phase})", LIBERATION_INDEXES, key=f"lib_{phase}")
-                
-                tagging_data[phase] = {
-                    "EN933_Class": en_class,
-                    "Carbonation": carb_state,
-                    "Liberation": lib_idx
+            litho_tag = ""
+            if sample_type == "Concrete - I.S.465":
+                litho_tag = st.selectbox("I.S. 465 Main Lithology Tag", IS465_LITHOLOGY_CODES)
+
+            # Traverse calculations
+            df_raw["X_um"] = df_raw["X"] * SCALE_UM_PER_PX
+            df_raw["Y_um"] = df_raw["Y"] * SCALE_UM_PER_PX
+            x_min_um, x_max_um = df_raw["X_um"].min(), df_raw["X_um"].max()
+            y_min_um, y_max_um = df_raw["Y_um"].min(), df_raw["Y_um"].max()
+            width_mm = (x_max_um - x_min_um) / 1000.0
+            height_mm = (y_max_um - y_min_um) / 1000.0
+            area_mm2 = width_mm * height_mm
+
+            unique_y = np.sort(df_raw["Y_um"].unique())
+            unique_x = np.sort(df_raw["X_um"].unique())
+            num_traverses = len(unique_y)
+            num_transects = len(unique_x)
+            total_linear_traverse_mm = num_traverses * width_mm
+
+            st.markdown(f"""
+            <div class="metric-card">
+                <b>Total Gross Points:</b> {len(df_raw)} &nbsp;|&nbsp; <b>Bounding Area:</b> {area_mm2:.2f} mm²<br>
+                <b>Linear Traverse:</b> {total_linear_traverse_mm:.1f} mm &nbsp;|&nbsp; <b>Traverses/Transects:</b> {num_traverses} × {num_transects}
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown("---")
+            st.subheader("🛠️ Term Standardization")
+            
+            unique_terms = df_raw["Raw_Term"].unique().tolist()
+            lookup = DEFAULT_LOOKUPS.get(sample_type, {})
+            mapping_dict = {}
+            
+            for term in unique_terms:
+                default_val = lookup.get(term, term)
+                mapping_dict[term] = st.text_input(f"Raw: **{term}**", value=default_val, key=f"map_{term}")
+
+            df_mapped = df_raw.copy()
+            df_mapped["Standardized_Phase"] = df_mapped["Raw_Term"].map(mapping_dict)
+            df_valid = df_mapped[df_mapped["Standardized_Phase"].str.upper() != "NA"].copy()
+            valid_points_count = len(df_valid)
+            na_count = len(df_mapped) - valid_points_count
+
+            st.caption(f"ℹ️ {na_count} 'NA' points excluded. Valid point count: **{valid_points_count}**.")
+
+            # Recycled aggregate phase tagging
+            tagging_data = {}
+            if sample_type == "Aggregate - Recycled":
+                st.write("##### EN 933-11 Classification Tags")
+                active_phases = df_valid["Standardized_Phase"].unique().tolist()
+                for phase in active_phases:
+                    t_col1, t_col2 = st.columns(2)
+                    en_class = t_col1.selectbox(f"EN933 ({phase})", EN933_11_CLASSES, key=f"en_{phase}")
+                    carb_state = t_col2.selectbox(f"Carb ({phase})", CARBONATION_STATES, key=f"carb_{phase}")
+                    lib_idx = st.selectbox(f"Liberation ({phase})", LIBERATION_INDEXES, key=f"lib_{phase}")
+                    tagging_data[phase] = {"EN933_Class": en_class, "Carbonation": carb_state, "Liberation": lib_idx}
+
+                df_valid["EN933_Class"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["EN933_Class"])
+                df_valid["Carbonation"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["Carbonation"])
+                df_valid["Liberation"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["Liberation"])
+
+            # Save & commit button
+            st.markdown("---")
+            if st.button("💾 Confirm QC & Save to Database", type="primary"):
+                meta_payload = {
+                    "sample_id": sample_id,
+                    "job_number": job_number,
+                    "sample_order": sample_order,
+                    "sample_type": sample_type,
+                    "operator": operator,
+                    "total_points": len(df_raw),
+                    "valid_points": valid_points_count,
+                    "area_mm2": area_mm2,
+                    "linear_traverse_mm": total_linear_traverse_mm,
+                    "lithology_code": litho_tag
                 }
+                if sample_type == "Aggregate - Recycled" and tagging_data:
+                    tag_df = pd.DataFrame.from_dict(tagging_data, orient='index').reset_index().rename(columns={'index': 'Standardized_Phase'})
+                    summary_save = summary.merge(tag_df, on="Standardized_Phase", how="left")
+                else:
+                    summary_save = summary
+                    
+                save_sample_to_db(meta_payload, summary_save)
+                st.session_state["is_db_committed"] = True
+                st.success(f"Sample '{sample_id}' successfully committed to database!")
 
-            df_valid["EN933_Class"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["EN933_Class"])
-            df_valid["Carbonation"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["Carbonation"])
-            df_valid["Liberation"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["Liberation"])
-
-        st.markdown("---")
-        st.subheader("📊 Step 3: Modal Analysis Results")
-
-        summary = df_valid.groupby("Standardized_Phase").size().reset_index(name="Point_Count")
-        summary["Modal_Percent (%)"] = (summary["Point_Count"] / valid_points_count) * 100
-        
-        p = summary["Modal_Percent (%)"] / 100
-        summary["Std_Error (%)"] = 2 * np.sqrt((p * (1 - p)) / valid_points_count) * 100
-
-        if sample_type in ["Aggregates", "Aggregate - Recycled", "Rock"]:
-            summary["Abundance"] = summary["Modal_Percent (%)"].apply(classify_abundance)
-
-        summary["Modal_Percent (%)"] = summary["Modal_Percent (%)"].round(2)
-        summary["Std_Error (%)"] = summary["Std_Error (%)"].round(2)
-
-        st.session_state["active_sample_id"] = sample_id
-        st.session_state["active_summary"] = summary.copy()
-        st.session_state["active_job_number"] = job_number
-        st.session_state["active_sample_order"] = sample_order
-        st.session_state["active_operator"] = operator
-
-        col_tbl, col_chart = st.columns([1.2, 1])
-        with col_tbl:
-            st.write("##### Phase Modal Percentage Table")
-            st.dataframe(summary, width="stretch")
-
-        with col_chart:
-            st.write("##### Modal Composition Chart")
-            fig_bar = px.bar(
-                summary, x="Standardized_Phase", y="Modal_Percent (%)", 
-                text="Modal_Percent (%)", color="Standardized_Phase"
-            )
-            st.plotly_chart(fig_bar, width="stretch")
-
-        # QAPF Ternary Plot
-        if sample_type in ["Rock", "Aggregates"]:
-            st.markdown("---")
-            st.subheader("🔺 QAPF Ternary Classification")
+        with right_pane:
+            st.subheader("📊 Live Analytical Viewport")
             
-            q_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Quartz", case=False), "Point_Count"].sum()
-            a_cnt = summary.loc[summary["Standardized_Phase"].str.contains("K-Feldspar|Alkali", case=False), "Point_Count"].sum()
-            p_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Plagioclase", case=False), "Point_Count"].sum()
-            
-            qap_sum = q_cnt + a_cnt + p_cnt
-            if qap_sum > 0:
-                norm_q = (q_cnt / qap_sum) * 100
-                norm_a = (a_cnt / qap_sum) * 100
-                norm_p = (p_cnt / qap_sum) * 100
+            # Modal Analysis Computation
+            summary = df_valid.groupby("Standardized_Phase").size().reset_index(name="Point_Count")
+            summary["Modal_Percent (%)"] = (summary["Point_Count"] / valid_points_count) * 100
+            p = summary["Modal_Percent (%)"] / 100
+            summary["Std_Error (%)"] = 2 * np.sqrt((p * (1 - p)) / valid_points_count) * 100
 
-                fig_ternary = go.Figure(go.Scatterternary({
-                    'mode': 'markers',
-                    'a': [norm_q],
-                    'b': [norm_a],
-                    'c': [norm_p],
-                    'text': [f"Sample: {sample_id}"],
-                    'marker': {'symbol': 'circle', 'size': 14, 'color': 'red'}
-                }))
-                fig_ternary.update_layout({
-                    'ternary': {
-                        'sum': 100,
-                        'aaxis': {'title': 'Quartz (Q)'},
-                        'baxis': {'title': 'Alkali Feldspar (A)'},
-                        'caxis': {'title': 'Plagioclase (P)'}
-                    },
-                    'title': 'Q-A-P Ternary Plot'
-                })
-                st.plotly_chart(fig_ternary, width="stretch")
+            if sample_type in ["Aggregates", "Aggregate - Recycled", "Rock"]:
+                summary["Abundance"] = summary["Modal_Percent (%)"].apply(classify_abundance)
 
-        # Concrete I.S. 465 Aggregate Derivations
-        if sample_type == "Concrete - I.S.465":
-            st.markdown("---")
-            st.subheader("🧱 Concrete - I.S. 465 Aggregate Derivations")
-            
-            good_agg_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Good Aggregate", case=False), "Point_Count"].sum()
-            bad_agg_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Bad Aggregate", case=False), "Point_Count"].sum()
-            total_agg_cnt = good_agg_cnt + bad_agg_cnt
+            summary["Modal_Percent (%)"] = summary["Modal_Percent (%)"].round(2)
+            summary["Std_Error (%)"] = summary["Std_Error (%)"].round(2)
 
-            if total_agg_cnt > 0:
-                total_agg_pct = (total_agg_cnt / valid_points_count) * 100
-                pct_good_of_agg = (good_agg_cnt / total_agg_cnt) * 100
-                pct_bad_of_agg = (bad_agg_cnt / total_agg_cnt) * 100
+            st.session_state["active_sample_id"] = sample_id
+            st.session_state["active_summary"] = summary.copy()
+            st.session_state["active_job_number"] = job_number
+            st.session_state["active_sample_order"] = sample_order
+            st.session_state["active_operator"] = operator
+            st.session_state["active_sample_type"] = sample_type
 
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Overall Aggregate Content", f"{total_agg_pct:.2f} %")
-                m2.metric("% Good Aggregate (of Total Agg)", f"{pct_good_of_agg:.2f} %")
-                m3.metric("% Bad Aggregate (of Total Agg)", f"{pct_bad_of_agg:.2f} %")
-            else:
-                st.warning("No points mapped to 'Good Aggregate' or 'Bad Aggregate' were found in this sample.")
+            tab_plot1, tab_plot2, tab_plot3 = st.tabs(["📍 Spatial Distribution Map", "📊 Modal Percentages", "🧱 I.S. 465 / Standards"])
 
-        # Aggregate Density, wt%, and BS 8500 ASR Module
-        if sample_type in ["Aggregates", "Aggregate - Recycled"]:
-            st.markdown("---")
-            st.subheader("⚖️ Aggregate Density, Weight % (wt%), & BS 8500-2 ASR Risk")
+            with tab_plot1:
+                fig_scatter = px.scatter(
+                    df_valid, x="X_um", y="Y_um", color="Standardized_Phase",
+                    title="Thin Section Coordinate Distribution (μm)"
+                )
+                fig_scatter.update_yaxes(autorange="reversed")
+                fig_scatter.update_layout(height=420)
+                st.plotly_chart(fig_scatter, width="stretch")
 
-            agg_tab1, agg_tab2 = st.tabs(["Phase Densities & wt% Recalculation", "BS 8500-2 Annex C ASR Assessment"])
+                R_val, R_desc = calculate_spatial_index(df_valid)
+                if R_val is not None:
+                    st.markdown(f"""
+                    <div class="metric-card">
+                        <b>Clark-Evans Dispersion Ratio (R):</b> {R_val:.3f} &nbsp;|&nbsp; 
+                        <b>Pattern:</b> <span class="status-pill pill-blue">{R_desc}</span>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-            with agg_tab1:
-                st.write("Enter density values (g/cm³) to calculate Weight Percentages (wt%):")
-                densities = []
-                d_cols = st.columns(len(summary))
-                
-                for idx, row in summary.iterrows():
-                    phase_n = row["Standardized_Phase"]
-                    def_d = DEFAULT_DENSITIES.get(phase_n, 2.65)
-                    with d_cols[idx % len(d_cols)]:
-                        d_val = st.number_input(f"Density: {phase_n}", value=def_d, step=0.05, key=f"d_up_{phase_n}")
-                        densities.append(d_val)
-                
-                summary["Density (g/cm³)"] = densities
-                mass_factor = summary["Modal_Percent (%)"] * summary["Density (g/cm³)"]
-                summary["Weight_Percent (%)"] = (mass_factor / mass_factor.sum()) * 100
-                summary["Weight_Percent (%)"] = summary["Weight_Percent (%)"].round(2)
+            with tab_plot2:
+                fig_bar = px.bar(
+                    summary, x="Standardized_Phase", y="Modal_Percent (%)", 
+                    text="Modal_Percent (%)", color="Standardized_Phase",
+                    title="Phase Modal Composition (%)"
+                )
+                fig_bar.update_layout(height=340)
+                st.plotly_chart(fig_bar, width="stretch")
+                st.dataframe(summary, width="stretch")
 
-                st.dataframe(summary[["Standardized_Phase", "Point_Count", "Modal_Percent (%)", "Density (g/cm³)", "Weight_Percent (%)"]], width="stretch")
+            with tab_plot3:
+                if sample_type == "Concrete - I.S.465":
+                    good_agg_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Good Aggregate", case=False), "Point_Count"].sum()
+                    bad_agg_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Bad Aggregate", case=False), "Point_Count"].sum()
+                    total_agg_cnt = good_agg_cnt + bad_agg_cnt
 
-            with agg_tab2:
-                asr_risk, asr_desc = evaluate_asr_risk(summary)
-                st.metric("BS 8500-2 Annex C ASR Risk Rating", asr_risk)
-                st.info(asr_desc)
+                    if total_agg_cnt > 0:
+                        total_agg_pct = (total_agg_cnt / valid_points_count) * 100
+                        pct_good_of_agg = (good_agg_cnt / total_agg_cnt) * 100
+                        pct_bad_of_agg = (bad_agg_cnt / total_agg_cnt) * 100
 
-        # Spatial Scatter Map & Dispersion
-        st.markdown("---")
-        st.subheader("📍 Thin Section Point Spatial Distribution & Index")
+                        st.metric("Total Aggregate Fraction", f"{total_agg_pct:.2f} %")
+                        c_iso1, c_iso2 = st.columns(2)
+                        c_iso1.metric("Good Aggregate Ratio", f"{pct_good_of_agg:.1f} %")
+                        c_iso2.metric("Bad / Deleterious Ratio", f"{pct_bad_of_agg:.1f} %")
+                elif sample_type in ["Rock", "Aggregates"]:
+                    q_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Quartz", case=False), "Point_Count"].sum()
+                    a_cnt = summary.loc[summary["Standardized_Phase"].str.contains("K-Feldspar|Alkali", case=False), "Point_Count"].sum()
+                    p_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Plagioclase", case=False), "Point_Count"].sum()
+                    qap_sum = q_cnt + a_cnt + p_cnt
+                    if qap_sum > 0:
+                        norm_q = (q_cnt / qap_sum) * 100
+                        norm_a = (a_cnt / qap_sum) * 100
+                        norm_p = (p_cnt / qap_sum) * 100
 
-        c_map, c_index = st.columns([2, 1])
+                        fig_ternary = go.Figure(go.Scatterternary({
+                            'mode': 'markers', 'a': [norm_q], 'b': [norm_a], 'c': [norm_p],
+                            'text': [f"Sample: {sample_id}"], 'marker': {'symbol': 'circle', 'size': 12, 'color': 'red'}
+                        }))
+                        fig_ternary.update_layout({
+                            'ternary': {'sum': 100, 'aaxis': {'title': 'Q'}, 'baxis': {'title': 'A'}, 'caxis': {'title': 'P'}},
+                            'title': 'Q-A-P Ternary Classification'
+                        })
+                        st.plotly_chart(fig_ternary, width="stretch")
+                else:
+                    st.info("No specific standard derived parameters for this material type.")
 
-        with c_map:
-            fig_scatter = px.scatter(
-                df_valid, x="X_um", y="Y_um", color="Standardized_Phase",
-                title="Spatial Point Distribution Across Thin Section (μm)"
-            )
-            fig_scatter.update_yaxes(autorange="reversed")
-            st.plotly_chart(fig_scatter, width="stretch")
-
-        with c_index:
-            st.write("##### Spatial Dispersion Coefficient")
-            R_val, R_desc = calculate_spatial_index(df_valid)
-            if R_val is not None:
-                st.metric("Nearest Neighbor Ratio (R)", f"{R_val:.3f}")
-                st.info(f"**Interpretation:** {R_desc}")
-
-        # Step 5: Save & Export Section
-        st.markdown("---")
-        st.subheader("💾 Step 5: Save & Export")
-        
-        col_save, col_dl = st.columns(2)
-        
-        if col_save.button("✅ Confirm QC & Save to Local Database", type="primary"):
-            meta_payload = {
-                "sample_id": sample_id,
-                "job_number": job_number,
-                "sample_order": sample_order,
-                "sample_type": sample_type,
-                "operator": operator,
-                "total_points": len(df_raw),
-                "valid_points": valid_points_count,
-                "area_mm2": area_mm2,
-                "linear_traverse_mm": total_linear_traverse_mm,
-                "lithology_code": litho_tag
-            }
-            
-            if sample_type == "Aggregate - Recycled" and tagging_data:
-                tag_df = pd.DataFrame.from_dict(tagging_data, orient='index').reset_index()
-                tag_df = tag_df.rename(columns={'index': 'Standardized_Phase'})
-                summary = summary.merge(tag_df, on="Standardized_Phase", how="left")
-                
-            save_sample_to_db(meta_payload, summary)
-            st.success(f"Sample '{sample_id}' successfully saved to database!")
-
-        csv_data = summary.to_csv(index=False).encode('utf-8')
-        col_dl.download_button(
-            label="📥 Download Interpreted Modal Report (CSV)",
-            data=csv_data,
-            file_name=f"{job_number}_{sample_id}_modal_report.csv",
-            mime="text/csv"
-        )
-        
     elif input_mode == "Load Existing Sample from DB" and existing_sample_data is not None:
-        # Load & Edit Existing Database Sample
-        st.subheader(f"📋 Editing Stored Record: {existing_sample_data['sample_id']}")
+        st.subheader(f"📋 Record Inspection: {existing_sample_data['sample_id']}")
         
-        col1, col2, col3, col4 = st.columns(4)
-        sample_id = col1.text_input("Sample ID (Primary Key)", value=str(existing_sample_data["sample_id"]), disabled=True)
-        col2.metric("Job Number", job_number)
-        col3.metric("Sample Order", sample_order)
-        col4.metric("Gross Points in DB", int(existing_sample_data["total_points"]))
+        # Split view for database edit mode
+        left_e, right_e = st.columns([4, 6])
+        with left_e:
+            sample_id = st.text_input("Sample ID", value=str(existing_sample_data["sample_id"]), disabled=True)
+            cur_litho = str(existing_sample_data.get("lithology_code", ""))
+            def_lith_idx = IS465_LITHOLOGY_CODES.index(cur_litho) if cur_litho in IS465_LITHOLOGY_CODES else 0
+            
+            litho_tag = ""
+            if sample_type == "Concrete - I.S.465":
+                litho_tag = st.selectbox("I.S. 465 Main Lithology Tag", IS465_LITHOLOGY_CODES, index=def_lith_idx)
 
-        cur_litho = str(existing_sample_data.get("lithology_code", ""))
-        def_lith_idx = IS465_LITHOLOGY_CODES.index(cur_litho) if cur_litho in IS465_LITHOLOGY_CODES else 0
-        
-        litho_tag = ""
-        if sample_type == "Concrete - I.S.465":
-            litho_tag = st.selectbox("I.S. 465 Main Aggregate Lithology Tag", IS465_LITHOLOGY_CODES, index=def_lith_idx)
-
-        st.markdown("---")
-        st.subheader("🛠️ Stored Modal Phases & Re-mapping")
-        
-        df_modal_edit = df_modal_loaded.copy()
-        
-        # Phase renaming and editing
-        st.write("Modify phase names or point values below:")
-        e_cols = st.columns(min(len(df_modal_edit), 3))
-        new_names = []
-        for idx, row in df_modal_edit.iterrows():
-            with e_cols[idx % len(e_cols)]:
+            df_modal_edit = df_modal_loaded.copy()
+            st.write("Modify phase names below:")
+            new_names = []
+            for idx, row in df_modal_edit.iterrows():
                 n_name = st.text_input(f"Phase #{idx+1}", value=row["phase_name"], key=f"re_p_{idx}")
                 new_names.append(n_name)
-        df_modal_edit["phase_name"] = new_names
-        
-        # Recalculate percentages
-        valid_tot = df_modal_edit["point_count"].sum()
-        df_modal_edit["modal_percent"] = (df_modal_edit["point_count"] / valid_tot * 100.0).round(2)
-        p = df_modal_edit["modal_percent"] / 100.0
-        df_modal_edit["std_error"] = (2 * np.sqrt((p * (1 - p)) / valid_tot) * 100.0).round(2)
-        
-        if sample_type in ["Aggregates", "Aggregate - Recycled", "Rock"]:
-            df_modal_edit["abundance"] = df_modal_edit["modal_percent"].apply(classify_abundance)
+            df_modal_edit["phase_name"] = new_names
+            
+            valid_tot = df_modal_edit["point_count"].sum()
+            df_modal_edit["modal_percent"] = (df_modal_edit["point_count"] / valid_tot * 100.0).round(2)
+            p = df_modal_edit["modal_percent"] / 100.0
+            df_modal_edit["std_error"] = (2 * np.sqrt((p * (1 - p)) / valid_tot) * 100.0).round(2)
 
-        col_t, col_c = st.columns([1.2, 1])
-        with col_t:
-            st.dataframe(df_modal_edit[["phase_name", "point_count", "modal_percent", "std_error", "abundance"]], width="stretch")
-        with col_c:
-            fig_edit = px.bar(df_modal_edit, x="phase_name", y="modal_percent", color="phase_name", title="Modal Composition")
+            st.session_state["active_sample_id"] = sample_id
+            st.session_state["active_summary"] = df_modal_edit.rename(columns={"phase_name": "Standardized_Phase", "modal_percent": "Modal_Percent (%)"}).copy()
+            st.session_state["active_job_number"] = job_number
+            st.session_state["active_sample_order"] = sample_order
+            st.session_state["active_operator"] = operator
+            st.session_state["active_sample_type"] = sample_type
+
+            st.markdown("---")
+            if st.button("💾 Overwrite & Recommit to Database", type="primary"):
+                meta_recommit = {
+                    "sample_id": sample_id,
+                    "job_number": job_number,
+                    "sample_order": sample_order,
+                    "sample_type": sample_type,
+                    "operator": operator,
+                    "total_points": existing_sample_data["total_points"],
+                    "valid_points": valid_tot,
+                    "area_mm2": existing_sample_data["bounding_area_mm2"],
+                    "linear_traverse_mm": existing_sample_data["linear_traverse_mm"],
+                    "lithology_code": litho_tag
+                }
+                save_sample_to_db(meta_recommit, df_modal_edit)
+                st.session_state["is_db_committed"] = True
+                st.success(f"Sample '{sample_id}' successfully updated and recommitted!")
+
+        with right_e:
+            st.write("##### Stored Modal Composition")
+            fig_edit = px.bar(df_modal_edit, x="phase_name", y="modal_percent", color="phase_name")
             st.plotly_chart(fig_edit, width="stretch")
-
-        st.session_state["active_sample_id"] = sample_id
-        st.session_state["active_summary"] = df_modal_edit.rename(columns={"phase_name": "Standardized_Phase", "modal_percent": "Modal_Percent (%)"}).copy()
-        st.session_state["active_job_number"] = job_number
-        st.session_state["active_sample_order"] = sample_order
-        st.session_state["active_operator"] = operator
-
-        st.markdown("---")
-        st.subheader("💾 Update & Recommit to Database")
-        
-        if st.button("💾 Update & Recommit Sample to Database", type="primary"):
-            meta_recommit = {
-                "sample_id": sample_id,
-                "job_number": job_number,
-                "sample_order": sample_order,
-                "sample_type": sample_type,
-                "operator": operator,
-                "total_points": existing_sample_data["total_points"],
-                "valid_points": valid_tot,
-                "area_mm2": existing_sample_data["bounding_area_mm2"],
-                "linear_traverse_mm": existing_sample_data["linear_traverse_mm"],
-                "lithology_code": litho_tag
-            }
-            save_sample_to_db(meta_recommit, df_modal_edit)
-            st.success(f"Sample '{sample_id}' successfully updated and recommitted to the database!")
+            st.dataframe(df_modal_edit[["phase_name", "point_count", "modal_percent", "std_error", "abundance"]], width="stretch")
     else:
         st.info("👈 Please upload a point count file or choose a database sample from the left sidebar to begin.")
 
 # =========================================================
-# TAB 2: AGGREGATE DENSITY & DB RE-EVALUATION EDITOR
+# TAB 2: INLINE DATA GRID DENSITY & WT% EDITOR
 # =========================================================
 with main_tab2:
-    st.header("⚖️ Database Aggregate Density & wt% Editor")
-    st.info("Load any previously saved sample from the database to inspect, reassign density values (g/cm³), and update weight percentages (wt%).")
+    st.header("⚖️ Database Aggregate Density & wt% DataGrid Editor")
+    st.info("Directly double-click cells in the interactive spreadsheet below to reassign specific densities (g/cm³). Weight percentages recalculate automatically.")
 
     df_db_samples = load_all_samples()
     if not df_db_samples.empty:
-        selected_db_id = st.selectbox("Select Saved Sample to Edit/Re-evaluate", df_db_samples["sample_id"].unique(), key="db_edit_sel")
+        selected_db_id = st.selectbox("Select Sample to Edit:", df_db_samples["sample_id"].unique(), key="db_edit_sel")
         
         if selected_db_id:
             sample_row = df_db_samples[df_db_samples["sample_id"] == selected_db_id].iloc[0]
             df_details = load_sample_details(selected_db_id)
             
-            st.markdown("---")
-            st.write(f"##### Selected Sample: **{selected_db_id}** | Job: **{sample_row['job_number']}** | Type: **{sample_row['sample_type']}**")
+            # Ensure default density exists if NaN
+            df_details["density_gcm3"] = df_details.apply(
+                lambda r: float(r["density_gcm3"]) if pd.notnull(r["density_gcm3"]) else DEFAULT_DENSITIES.get(r["phase_name"], 2.65),
+                axis=1
+            )
 
-            st.write("Reassign densities (g/cm³) for each phase:")
-            edited_densities = []
+            # Interactive spreadsheet editor
+            grid_df = df_details[["phase_name", "point_count", "modal_percent", "density_gcm3"]].copy()
             
-            ed_cols = st.columns(len(df_details))
-            for idx, r in df_details.iterrows():
-                p_name = r["phase_name"]
-                cur_d = r["density_gcm3"] if pd.notnull(r["density_gcm3"]) else DEFAULT_DENSITIES.get(p_name, 2.65)
-                with ed_cols[idx % len(ed_cols)]:
-                    new_d = st.number_input(f"Density: {p_name}", value=float(cur_d), step=0.05, key=f"db_d_{selected_db_id}_{p_name}")
-                    edited_densities.append(new_d)
-                    
-            df_details["density_gcm3"] = edited_densities
-            mass_f = df_details["modal_percent"] * df_details["density_gcm3"]
-            df_details["wt_percent"] = (mass_f / mass_f.sum()) * 100
-            df_details["wt_percent"] = df_details["wt_percent"].round(2)
-            
-            st.write("##### Updated Modal & Weight Percentage Table")
-            st.dataframe(df_details[["phase_name", "point_count", "modal_percent", "density_gcm3", "wt_percent", "abundance"]], width="stretch")
+            edited_grid = st.data_editor(
+                grid_df,
+                disabled=["phase_name", "point_count", "modal_percent"],  # Lock raw measurements
+                column_config={
+                    "phase_name": st.column_config.TextColumn("Phase / Mineral", help="Standardized phase name"),
+                    "point_count": st.column_config.NumberColumn("Points", help="Stereological raw count"),
+                    "modal_percent": st.column_config.NumberColumn("Modal Vol %", format="%.2f %%"),
+                    "density_gcm3": st.column_config.NumberColumn("Density (g/cm³)", min_value=1.0, max_value=8.0, step=0.01, format="%.2f")
+                },
+                use_container_width=True,
+                key=f"editor_{selected_db_id}"
+            )
 
-            df_details_eval = df_details.rename(columns={"phase_name": "Standardized_Phase", "modal_percent": "Modal_Percent (%)"})
-            re_asr_risk, re_asr_desc = evaluate_asr_risk(df_details_eval)
-            st.metric("Re-evaluated BS 8500-2 Annex C ASR Risk", re_asr_risk)
-            st.info(re_asr_desc)
+            # Recalculate wt% dynamically from grid values
+            mass_factors = edited_grid["modal_percent"] * edited_grid["density_gcm3"]
+            total_mass = mass_factors.sum()
+            edited_grid["wt_percent"] = ((mass_factors / total_mass) * 100.0).round(2) if total_mass > 0 else 0.0
 
-            if st.button("💾 Overwrite & Save Updated Densities to DB", type="primary"):
+            st.write("##### Resulting Mass Balance & ASR Threat Assessment")
+            res_col1, res_col2 = st.columns([1.5, 1])
+            with res_col1:
+                st.dataframe(edited_grid[["phase_name", "modal_percent", "density_gcm3", "wt_percent"]], width="stretch")
+
+            with res_col2:
+                df_eval = edited_grid.rename(columns={"phase_name": "Standardized_Phase", "modal_percent": "Modal_Percent (%)"})
+                re_asr_risk, re_asr_desc = evaluate_asr_risk(df_eval)
+                
+                risk_pill = "pill-green" if "LOW" in re_asr_risk else ("pill-amber" if "MEDIUM" in re_asr_risk else "pill-red")
+                st.markdown(f"""
+                <div class="metric-card">
+                    <b>ASR Risk Rating:</b> <span class="status-pill {risk_pill}">{re_asr_risk}</span>
+                    <p style="font-size:0.85rem; margin-top:8px;">{re_asr_desc}</p>
+                </div>
+                """, unsafe_allow_html=True)
+
+            if st.button("💾 Save Reassigned Densities to Database", type="primary"):
                 meta_update = {
                     "sample_id": sample_row["sample_id"],
                     "job_number": sample_row["job_number"],
@@ -976,6 +936,9 @@ with main_tab2:
                     "linear_traverse_mm": sample_row["linear_traverse_mm"],
                     "lithology_code": sample_row.get("lithology_code", "")
                 }
+                
+                df_details["density_gcm3"] = edited_grid["density_gcm3"]
+                df_details["wt_percent"] = edited_grid["wt_percent"]
                 
                 df_details_to_save = df_details.rename(columns={
                     "phase_name": "Standardized_Phase",
@@ -991,16 +954,16 @@ with main_tab2:
                 })
                 
                 save_sample_to_db(meta_update, df_details_to_save)
-                st.success(f"Sample '{selected_db_id}' updated in database with new density & wt% calculations!")
+                st.success(f"Sample '{selected_db_id}' successfully updated in database!")
     else:
         st.info("No saved samples available in the database to edit yet.")
 
 # =========================================================
-# TAB 3: CONCRETE MIX DESIGN ENGINE (APPROACH B & A)
+# TAB 3: BENTO GRID CONCRETE MIX DESIGN ENGINE
 # =========================================================
 with main_tab3:
     st.header("🏗️ Hardened Concrete Mix Reverse-Engineering & Performance Engine")
-    st.info("Back-calculate original concrete mix proportions ($1\\text{ m}^3$), 28-day cube strength (UK DoE 1B), and fresh slump using stereological modal points.")
+    st.info("Convert stereological area fractions into batch quantities ($1\\text{ m}^3$), 28-day cube strengths, and slump workability classes.")
 
     mix_source = st.radio("Select Modal Data Source:", ["Active Session Point Count", "Load Sample from Database"], horizontal=True)
 
@@ -1042,91 +1005,60 @@ with main_tab3:
 
     if not df_mix_input.empty:
         st.markdown("---")
-        st.subheader("1. Component Classification & Physical Densities")
         
-        def auto_classify(p_name):
-            p = str(p_name).lower()
-            if any(k in p for k in ["paste", "cement", "binder", "matrix"]):
-                return "Cement Paste / Binder"
-            elif any(k in p for k in ["void", "air", "pore"]):
-                return "Air Voids"
-            elif any(k in p for k in ["sand", "fine", "matrix sand"]):
-                return "Fine Aggregate"
-            else:
-                return "Coarse Aggregate"
+        # 1. Config Ribbon
+        with st.expander("⚙️ Component Classification & Material Constants", expanded=False):
+            def auto_classify(p_name):
+                p = str(p_name).lower()
+                if any(k in p for k in ["paste", "cement", "binder", "matrix"]):
+                    return "Cement Paste / Binder"
+                elif any(k in p for k in ["void", "air", "pore"]):
+                    return "Air Voids"
+                elif any(k in p for k in ["sand", "fine", "matrix sand"]):
+                    return "Fine Aggregate"
+                else:
+                    return "Coarse Aggregate"
 
-        classifications = []
-        c_cols = st.columns(min(len(df_mix_input), 4))
-        for idx, row in df_mix_input.iterrows():
-            p_name = row["Phase"]
-            def_cat = auto_classify(p_name)
-            with c_cols[idx % len(c_cols)]:
-                cat = st.selectbox(
-                    f"Role: **{p_name}** ({row['Vol_Pct']:.1f}%)",
-                    ["Cement Paste / Binder", "Fine Aggregate", "Coarse Aggregate", "Air Voids"],
-                    index=["Cement Paste / Binder", "Fine Aggregate", "Coarse Aggregate", "Air Voids"].index(def_cat),
-                    key=f"cat_{mix_sample_label}_{p_name}"
-                )
-                classifications.append(cat)
-                
-        df_mix_input["Role"] = classifications
+            classifications = []
+            c_cols = st.columns(min(len(df_mix_input), 4))
+            for idx, row in df_mix_input.iterrows():
+                p_name = row["Phase"]
+                def_cat = auto_classify(p_name)
+                with c_cols[idx % len(c_cols)]:
+                    cat = st.selectbox(
+                        f"Role: {p_name}",
+                        ["Cement Paste / Binder", "Fine Aggregate", "Coarse Aggregate", "Air Voids"],
+                        index=["Cement Paste / Binder", "Fine Aggregate", "Coarse Aggregate", "Air Voids"].index(def_cat),
+                        key=f"cat_{mix_sample_label}_{p_name}"
+                    )
+                    classifications.append(cat)
+                    
+            df_mix_input["Role"] = classifications
 
         v_paste = float(df_mix_input.loc[df_mix_input["Role"] == "Cement Paste / Binder", "Vol_Pct"].sum())
         v_fine = float(df_mix_input.loc[df_mix_input["Role"] == "Fine Aggregate", "Vol_Pct"].sum())
         v_coarse = float(df_mix_input.loc[df_mix_input["Role"] == "Coarse Aggregate", "Vol_Pct"].sum())
         v_void = float(df_mix_input.loc[df_mix_input["Role"] == "Air Voids", "Vol_Pct"].sum())
 
-        st.write("##### Consolidated Volumetric Breakdown (Area % = Volume %)")
-        b1, b2, b3, b4 = st.columns(4)
-        b1.metric("Cement Paste Volume", f"{v_paste:.2f} %")
-        b2.metric("Fine Aggregate Volume", f"{v_fine:.2f} %")
-        b3.metric("Coarse Aggregate Volume", f"{v_coarse:.2f} %")
-        b4.metric("Macroscopic Air Voids", f"{v_void:.2f} %")
-
-        st.markdown("---")
-        st.subheader("2. Petrographic Mix Inputs & Reverse-Engineering Model")
-
-        p_col1, p_col2 = st.columns(2)
+        # Parameters
+        p_col1, p_col2 = st.columns([1, 1])
         with p_col1:
-            wb_ratio = st.slider(
-                "Petrographically Estimated Water/Binder Ratio (w/b):",
-                min_value=0.25, max_value=0.80, value=0.48, step=0.01,
-                help="Derived from fluorescent thin section dye intensity against reference paste standards and capillary porosity."
-            )
-            calc_approach = st.radio(
-                "Calculation Formulation:",
-                ["Approach B: Mass Balance (BS 1881-124 / ASTM C856) [Default]", 
-                 "Approach A: Physical Hydration (Powers-Brownyard)"],
-                index=0
-            )
+            wb_ratio = st.slider("Estimated w/b Ratio:", 0.25, 0.80, 0.48, 0.01)
+            calc_approach = st.radio("Approach:", ["Approach B: Mass Balance (BS 1881-124)", "Approach A: Powers-Brownyard"], horizontal=True)
 
         with p_col2:
-            scm_type = st.selectbox(
-                "Binder Composition (SCM Replacement):",
-                ["100% CEM I (Portland)", "30% GGBS (Slag)", "25% PFA (Fly Ash)", "7% Silica Fume"]
-            )
-            d_col1, d_col2, d_col3 = st.columns(3)
-            
-            if "GGBS" in scm_type:
-                def_rho_b = 3.07
-            elif "PFA" in scm_type:
-                def_rho_b = 2.94
-            elif "Silica Fume" in scm_type:
-                def_rho_b = 3.08
-            else:
-                def_rho_b = 3.15
+            scm_type = st.selectbox("Binder Type:", ["100% CEM I", "30% GGBS", "25% PFA", "7% Silica Fume"])
+            def_rho_b = 3.07 if "GGBS" in scm_type else (2.94 if "PFA" in scm_type else (3.08 if "Silica" in scm_type else 3.15))
+            c_d1, c_d2, c_d3 = st.columns(3)
+            rho_cement = float(c_d1.number_input("Binder ρ", value=float(def_rho_b), step=0.01))
+            rho_fine = float(c_d2.number_input("Fine Agg ρ", value=2.65, step=0.01))
+            rho_coarse = float(c_d3.number_input("Coarse Agg ρ", value=2.68, step=0.01))
 
-            rho_cement = float(d_col1.number_input("Binder Density (g/cm³)", value=float(def_rho_b), step=0.01))
-            rho_fine = float(d_col2.number_input("Fine Agg Density (g/cm³)", value=2.65, step=0.01))
-            rho_coarse = float(d_col3.number_input("Coarse Agg Density (g/cm³)", value=2.68, step=0.01))
-
-        # ---------------------------------------------------------
-        # MIX RECONSTRUCTION CALCULATIONS
-        # ---------------------------------------------------------
-        rho_water = 1.00  # g/cm³ (= 1000 kg/m³ or 1.0 kg/L)
+        # Reconstructed batch physics
+        rho_water = 1.00
         v_total_agg = v_fine + v_coarse
 
-        # APPROACH B: Absolute Volume Conservation (BS 1881-124)
+        # Approach B
         v_paste_avail_m3 = max(0.05, 1.0 - ((v_total_agg + v_void) / 100.0))
         denom_b = (1.0 / (rho_cement * 1000.0)) + (wb_ratio / (rho_water * 1000.0))
         c_kg_b = v_paste_avail_m3 / denom_b
@@ -1135,7 +1067,7 @@ with main_tab3:
         coarse_kg_b = 10.0 * v_coarse * rho_coarse
         fresh_density_b = c_kg_b + w_kg_b + fine_kg_b + coarse_kg_b
 
-        # APPROACH A: Powers-Brownyard Physical Hydration Stoichiometry
+        # Approach A
         v_c0_pct = v_paste / (1.0 + wb_ratio * (rho_cement / rho_water)) if (1.0 + wb_ratio * (rho_cement / rho_water)) > 0 else 0
         c_kg_a = 10.0 * v_c0_pct * rho_cement
         w_kg_a = c_kg_a * wb_ratio
@@ -1143,7 +1075,6 @@ with main_tab3:
         coarse_kg_a = 10.0 * v_coarse * rho_coarse
         fresh_density_a = c_kg_a + w_kg_a + fine_kg_a + coarse_kg_a
 
-        # Select values based on user toggle
         is_approach_b = "Approach B" in calc_approach
         c_kg = c_kg_b if is_approach_b else c_kg_a
         w_kg = w_kg_b if is_approach_b else w_kg_a
@@ -1151,7 +1082,6 @@ with main_tab3:
         coarse_kg = coarse_kg_b if is_approach_b else coarse_kg_a
         fresh_density = fresh_density_b if is_approach_b else fresh_density_a
 
-        # Batch Volumes (L/m³)
         v_c_L = c_kg / rho_cement
         v_w_L = w_kg / rho_water
         v_fine_L = fine_kg / rho_fine
@@ -1159,7 +1089,6 @@ with main_tab3:
         v_air_L = v_void * 10.0
         total_batch_vol_L = v_c_L + v_w_L + v_fine_L + v_coarse_L + v_air_L
 
-        # Determined Mass % (wt%) & Volumetric % Content
         c_wt_pct = (c_kg / fresh_density) * 100.0 if fresh_density > 0 else 0.0
         w_wt_pct = (w_kg / fresh_density) * 100.0 if fresh_density > 0 else 0.0
         fine_wt_pct = (fine_kg / fresh_density) * 100.0 if fresh_density > 0 else 0.0
@@ -1172,245 +1101,120 @@ with main_tab3:
         coarse_vol_pct = (v_coarse_L / total_batch_vol_L) * 100.0 if total_batch_vol_L > 0 else 0.0
         air_vol_pct = (v_air_L / total_batch_vol_L) * 100.0 if total_batch_vol_L > 0 else 0.0
 
-        # Mix Proportions 1 : X
-        prop_c = 1.0
         prop_fine = fine_kg / c_kg if c_kg > 0 else 0.0
         prop_coarse = coarse_kg / c_kg if c_kg > 0 else 0.0
         total_agg_ratio = prop_fine + prop_coarse
 
-        st.markdown("---")
-        st.subheader("3. Reconstructed Mix Proportions & Determined Content")
-
-        df_mix_res = pd.DataFrame({
-            "Constituent": ["Binder (Cementitious)", "Water", "Fine Aggregate", "Coarse Aggregate", "Air Voids"],
-            "Batch Weight (kg/m³)": [f"{c_kg:.1f}", f"{w_kg:.1f}", f"{fine_kg:.1f}", f"{coarse_kg:.1f}", "0.0"],
-            "Determined Mass % (wt%)": [f"{c_wt_pct:.1f}%", f"{w_wt_pct:.1f}%", f"{fine_wt_pct:.1f}%", f"{coarse_wt_pct:.1f}%", "0.0%"],
-            "Batch Volume (L/m³)": [f"{v_c_L:.1f}", f"{v_w_L:.1f}", f"{v_fine_L:.1f}", f"{v_coarse_L:.1f}", f"{v_air_L:.1f}"],
-            "Determined Vol %": [f"{c_vol_pct:.1f}%", f"{w_vol_pct:.1f}%", f"{fine_vol_pct:.1f}%", f"{coarse_vol_pct:.1f}%", f"{air_vol_pct:.1f}%"],
-            "Mix Proportion (1 : X)": [
-                "1.00",
-                f"{wb_ratio:.2f} (w/b)",
-                f"{prop_fine:.2f}",
-                f"{prop_coarse:.2f}",
-                f"{v_void:.1f}% Air"
-            ]
-        })
-
-        col_res1, col_res2 = st.columns([1.6, 1])
-        with col_res1:
+        # ------------------ BENTO 2X2 ANALYTICAL GRID ------------------
+        bento_r1_c1, bento_r1_c2 = st.columns(2)
+        
+        with bento_r1_c1:
+            st.markdown("#### 1. Reconstructed Batch Matrix (1 m³)")
+            df_mix_res = pd.DataFrame({
+                "Constituent": ["Binder (Cement)", "Water", "Fine Agg", "Coarse Agg", "Air Voids"],
+                "Batch Weight (kg/m³)": [f"{c_kg:.1f}", f"{w_kg:.1f}", f"{fine_kg:.1f}", f"{coarse_kg:.1f}", "0.0"],
+                "Determined Mass % (wt%)": [f"{c_wt_pct:.1f}%", f"{w_wt_pct:.1f}%", f"{fine_wt_pct:.1f}%", f"{coarse_wt_pct:.1f}%", "0.0%"],
+                "Batch Volume (L/m³)": [f"{v_c_L:.1f}", f"{v_w_L:.1f}", f"{v_fine_L:.1f}", f"{v_coarse_L:.1f}", f"{v_air_L:.1f}"],
+                "Determined Vol %": [f"{c_vol_pct:.1f}%", f"{w_vol_pct:.1f}%", f"{fine_vol_pct:.1f}%", f"{coarse_vol_pct:.1f}%", f"{air_vol_pct:.1f}%"],
+                "Mix Proportion (1 : X)": ["1.00", f"{wb_ratio:.2f}", f"{prop_fine:.2f}", f"{prop_coarse:.2f}", f"{v_void:.1f}% Air"]
+            })
             st.dataframe(df_mix_res, width="stretch")
+            st.markdown(f"""
+            <div class="metric-card">
+                <b>Fresh Density:</b> {fresh_density:.0f} kg/m³ &nbsp;|&nbsp; 
+                <b>Agg/Binder Ratio:</b> 1 : {total_agg_ratio:.2f} &nbsp;|&nbsp; 
+                <b>Total Aggregates:</b> {total_agg_wt_pct:.1f} wt%
+            </div>
+            """, unsafe_allow_html=True)
 
-        with col_res2:
-            st.metric("Total Fresh Density", f"{fresh_density:.0f} kg/m³")
-            st.metric("Total Aggregate Content", f"{total_agg_wt_pct:.1f} wt% ({v_total_agg:.1f} vol%)")
-            st.metric("Binder Content", f"{c_wt_pct:.1f} wt% ({c_kg:.0f} kg/m³)")
-            st.metric("Water Content", f"{w_wt_pct:.1f} wt% ({w_kg:.0f} kg/m³)")
-
-        # ---------------------------------------------------------
-        # GRAPHICAL 100% STACKED BAR CHARTS
-        # ---------------------------------------------------------
-        st.markdown("---")
-        st.subheader("📊 Mix Design Composition Visualisation")
-
-        col_chart_m, col_chart_v = st.columns(2)
-
-        with col_chart_m:
+        with bento_r1_c2:
+            st.markdown("#### 2. Mass & Volumetric Distribution")
             df_stacked_mass = pd.DataFrame([
-                {"Category": "Total Mass %", "Constituent": "Binder (Cement)", "Percentage": c_wt_pct},
-                {"Category": "Total Mass %", "Constituent": "Water", "Percentage": w_wt_pct},
-                {"Category": "Total Mass %", "Constituent": "Fine Aggregate", "Percentage": fine_wt_pct},
-                {"Category": "Total Mass %", "Constituent": "Coarse Aggregate", "Percentage": coarse_wt_pct}
+                {"Category": "Mass (wt%)", "Constituent": "Binder", "Percentage": c_wt_pct},
+                {"Category": "Mass (wt%)", "Constituent": "Water", "Percentage": w_wt_pct},
+                {"Category": "Mass (wt%)", "Constituent": "Fine Agg", "Percentage": fine_wt_pct},
+                {"Category": "Mass (wt%)", "Constituent": "Coarse Agg", "Percentage": coarse_wt_pct}
             ])
             fig_mass = px.bar(
                 df_stacked_mass, y="Category", x="Percentage", color="Constituent",
                 orientation='h', barmode='stack', text="Percentage",
-                title="100% Stacked Chart: Batch Mass (wt%)",
-                color_discrete_map={
-                    "Binder (Cement)": "#3366cc",
-                    "Water": "#22aa99",
-                    "Fine Aggregate": "#ff9900",
-                    "Coarse Aggregate": "#dc3912"
-                }
+                color_discrete_map={"Binder": "#3366cc", "Water": "#22aa99", "Fine Agg": "#ff9900", "Coarse Agg": "#dc3912"}
             )
             fig_mass.update_traces(texttemplate='%{text:.1f}%', textposition='inside')
-            fig_mass.update_layout(xaxis=dict(ticksuffix="%", range=[0, 100]), yaxis_title=None, height=260)
+            fig_mass.update_layout(xaxis=dict(ticksuffix="%", range=[0, 100]), yaxis_title=None, height=200, margin=dict(t=10, b=10))
             st.plotly_chart(fig_mass, width="stretch")
 
-        with col_chart_v:
-            df_stacked_vol = pd.DataFrame([
-                {"Category": "Total Vol %", "Constituent": "Binder", "Percentage": c_vol_pct},
-                {"Category": "Total Vol %", "Constituent": "Water", "Percentage": w_vol_pct},
-                {"Category": "Total Vol %", "Constituent": "Fine Aggregate", "Percentage": fine_vol_pct},
-                {"Category": "Total Vol %", "Constituent": "Coarse Aggregate", "Percentage": coarse_vol_pct},
-                {"Category": "Total Vol %", "Constituent": "Air Voids", "Percentage": air_vol_pct}
-            ])
-            fig_vol = px.bar(
-                df_stacked_vol, y="Category", x="Percentage", color="Constituent",
-                orientation='h', barmode='stack', text="Percentage",
-                title="100% Stacked Chart: Volumetric Distribution (vol%)",
-                color_discrete_map={
-                    "Binder": "#3366cc",
-                    "Water": "#22aa99",
-                    "Fine Aggregate": "#ff9900",
-                    "Coarse Aggregate": "#dc3912",
-                    "Air Voids": "#999999"
-                }
-            )
-            fig_vol.update_traces(texttemplate='%{text:.1f}%', textposition='inside')
-            fig_vol.update_layout(xaxis=dict(ticksuffix="%", range=[0, 100]), yaxis_title=None, height=260)
-            st.plotly_chart(fig_vol, width="stretch")
+        bento_r2_c1, bento_r2_c2 = st.columns(2)
+        
+        with bento_r2_c1:
+            st.markdown("#### 3. 28-Day Strength (UK DoE 1B)")
+            s_c1, s_c2 = st.columns(2)
+            cement_grade = s_c1.selectbox("Cement Strength Class:", ["CEM I 52.5N / 52.5R", "CEM I 42.5N / 42.5R", "CEM II 32.5N"])
+            coarse_type = s_c2.selectbox("Aggregate Mineral Texture:", ["Crushed Rock", "Uncrushed Gravel"])
 
-        # ---------------------------------------------------------
-        # 4. PERFORMANCE & PROPERTY ESTIMATION
-        # ---------------------------------------------------------
-        st.markdown("---")
-        st.subheader("4. Engineering Performance & Workability Estimator")
-
-        p_tab1, p_tab2 = st.tabs(["Estimated Cube Strength (DoE 1B)", "Original Slump & Admixture 'What-If'"])
-
-        with p_tab1:
-            st.write("##### 28-Day Compressive Cube Strength (UK DoE / BRE Option 1B)")
-            s_col1, s_col2 = st.columns(2)
-            with s_col1:
-                cement_grade = st.selectbox(
-                    "Cement Strength Class:",
-                    ["CEM I 52.5N / 52.5R (High Early Strength)", 
-                     "CEM I 42.5N / 42.5R (Standard Portland)", 
-                     "CEM II 32.5N (Blended/Masonry)"]
-                )
-                coarse_type = st.selectbox("Aggregate Lithological Surface Type:", ["Crushed Rock (Basalt/Limestone/Granite)", "Uncrushed Natural River Gravel"])
-
-            if "52.5" in cement_grade:
-                base_f = 46.0 if "Crushed" in coarse_type else 42.0
-            elif "42.5" in cement_grade:
-                base_f = 39.0 if "Crushed" in coarse_type else 35.0
-            else:
-                base_f = 31.0 if "Crushed" in coarse_type else 27.0
+            base_f = 46.0 if "52.5" in cement_grade and "Crushed" in coarse_type else (
+                     42.0 if "52.5" in cement_grade else (
+                     39.0 if "42.5" in cement_grade and "Crushed" in coarse_type else (
+                     35.0 if "42.5" in cement_grade else 31.0)))
 
             calc_fcu_28 = base_f - 24.0 * np.log(max(0.20, wb_ratio) / 0.50)
-
             air_excess = max(0.0, v_void - 1.0)
             air_penalty_factor = max(0.50, 1.0 - (0.055 * air_excess))
             final_fcu_28 = max(5.0, calc_fcu_28 * air_penalty_factor)
             ci_low = max(5.0, final_fcu_28 - 4.5)
             ci_high = final_fcu_28 + 4.5
 
-            with s_col2:
-                st.metric("Estimated 28-Day Cube Strength (fcu, 28)", f"{final_fcu_28:.1f} MPa")
-                st.info(f"**95% Confidence Interval:** {ci_low:.1f} – {ci_high:.1f} MPa\n\n*Applied Air Void Penalty:* {((1.0 - air_penalty_factor)*100):.1f}% reduction due to {v_void:.1f}% voids.")
+            st.markdown(f"""
+            <div class="metric-card">
+                <b>Estimated Cube Strength:</b> <span style="font-size:1.25rem; font-weight:700; color:#1b365d;">{final_fcu_28:.1f} MPa</span><br>
+                <b>95% Confidence Interval:</b> {ci_low:.1f} – {ci_high:.1f} MPa<br>
+                <b>Air Void Penalty:</b> {((1.0 - air_penalty_factor)*100):.1f}% reduction ({v_void:.1f}% voids)
+            </div>
+            """, unsafe_allow_html=True)
 
-        with p_tab2:
-            st.write("##### Original Fresh Slump & Admixture 'What-If' Selector")
-            w_col1, w_col2 = st.columns(2)
-            with w_col1:
-                nom_max_agg = st.selectbox("Coarse Aggregate Maximum Size:", ["20 mm (Standard)", "10 mm", "40 mm"])
-                agg_angularity = st.selectbox("Particle Shape / Angularity:", ["Angular / Crushed Rock", "Sub-rounded / Irregular", "Rounded River Gravel", "Flaky / Elongated"])
-                admixture_scenario = st.selectbox(
-                    "Admixture 'What-If' Scenario:",
-                    ["Plain Concrete (No Water Reducer, beta = 1.00)",
-                     "Normal Water Reducer / Lignosulfonate (8-12% water reduction, beta = 0.90)",
-                     "Mid-Range Plasticizer / SNF (15-20% water reduction, beta = 0.82)",
-                     "High-Range Superplasticizer / PCE (25-35% water reduction, beta = 0.70)"]
-                )
+        with bento_r2_c2:
+            st.markdown("#### 4. Slump & Workability Estimator")
+            w_c1, w_c2 = st.columns(2)
+            nom_max_agg = w_c1.selectbox("Max Aggregate Size:", ["20 mm", "10 mm", "40 mm"])
+            admixture_scenario = w_c2.selectbox("Admixture 'What-If':", ["Plain (beta=1.00)", "Lignosulfonate (beta=0.90)", "SNF Mid-Range (beta=0.82)", "PCE High-Range (beta=0.70)"])
 
-            if "10 mm" in nom_max_agg:
-                w_base = 230.0
-            elif "40 mm" in nom_max_agg:
-                w_base = 190.0
-            else:
-                w_base = 210.0
-
-            if "Rounded" in agg_angularity:
-                w_shape = -20.0
-            elif "Sub-rounded" in agg_angularity:
-                w_shape = -10.0
-            elif "Flaky" in agg_angularity:
-                w_shape = +15.0
-            else:
-                w_shape = 0.0
-
+            w_base = 230.0 if "10 mm" in nom_max_agg else (190.0 if "40 mm" in nom_max_agg else 210.0)
+            beta_admix = 0.90 if "Lignosulfonate" in admixture_scenario else (0.82 if "SNF" in admixture_scenario else (0.70 if "PCE" in admixture_scenario else 1.00))
+            
             p_sand = (v_fine / v_total_agg * 100.0) if v_total_agg > 0 else 35.0
             w_sand = 0.5 * (p_sand - 35.0)
-
-            if "Lignosulfonate" in admixture_scenario:
-                beta_admix = 0.90
-            elif "Mid-Range" in admixture_scenario:
-                beta_admix = 0.82
-            elif "High-Range" in admixture_scenario:
-                beta_admix = 0.70
-            else:
-                beta_admix = 1.00
-
-            effective_target_water = (w_base + w_shape + w_sand) * beta_admix
+            effective_target_water = (w_base + w_sand) * beta_admix
             delta_w = w_kg - effective_target_water
             est_slump = 50.0 + (2.5 * delta_w)
 
-            if est_slump <= 25:
-                slump_class = "S1 (Very Stiff / Semi-Dry, 10 - 40 mm)"
-            elif 25 < est_slump <= 90:
-                slump_class = "S2 (Medium Workability, 50 - 90 mm)"
-            elif 90 < est_slump <= 150:
-                slump_class = "S3 (High Workability, 100 - 150 mm)"
-            elif 150 < est_slump <= 210:
-                slump_class = "S4 (Very High Workability, 160 - 210 mm)"
-            else:
-                slump_class = "S5 / Collapse (> 220 mm / Flowing Concrete)"
-
+            slump_class = "S1 (10-40 mm)" if est_slump <= 25 else ("S2 (50-90 mm)" if est_slump <= 90 else ("S3 (100-150 mm)" if est_slump <= 150 else "S4 (160-210 mm)"))
             est_slump_clamped = max(5.0, min(250.0, est_slump))
 
-            with w_col2:
-                st.metric("Estimated Fresh Slump", f"{est_slump_clamped:.0f} mm")
-                st.info(f"**Workability Class:** {slump_class}\n\n*Reference Water Demand:* {effective_target_water:.1f} kg/m³ vs *Actual Reconstructed:* {w_kg:.1f} kg/m³.")
+            st.markdown(f"""
+            <div class="metric-card">
+                <b>Estimated Slump:</b> <span style="font-size:1.25rem; font-weight:700; color:#1b365d;">{est_slump_clamped:.0f} mm</span><br>
+                <b>Workability Class:</b> <span class="status-pill pill-blue">{slump_class}</span><br>
+                <b>Target Water Demand:</b> {effective_target_water:.1f} kg/m³
+            </div>
+            """, unsafe_allow_html=True)
 
-        # ---------------------------------------------------------
-        # 5. PDF REPORT EXPORT SECTION
-        # ---------------------------------------------------------
+        # PDF Export
         st.markdown("---")
-        st.subheader("📑 5. Export Mix Design Report (PDF)")
-        
         pdf_meta = {
-            "sample_id": mix_sample_label,
-            "job_number": cur_job_num,
-            "sample_order": cur_sample_ord,
-            "operator": cur_op_name,
-            "approach": "Approach B (Mass Balance BS 1881-124)" if is_approach_b else "Approach A (Powers-Brownyard)",
-            "wb_ratio": wb_ratio,
-            "fresh_density": fresh_density
+            "sample_id": mix_sample_label, "job_number": cur_job_num, "sample_order": cur_sample_ord,
+            "operator": cur_op_name, "approach": "Approach B (Mass Balance)" if is_approach_b else "Approach A (Powers-Brownyard)",
+            "wb_ratio": wb_ratio, "fresh_density": fresh_density
         }
-        
-        pdf_strength = {
-            "strength": final_fcu_28,
-            "ci_low": ci_low,
-            "ci_high": ci_high,
-            "air_penalty": (1.0 - air_penalty_factor) * 100.0,
-            "air_pct": v_void
-        }
-        
-        pdf_slump = {
-            "slump": est_slump_clamped,
-            "class": slump_class
-        }
-        
-        pdf_mass_pcts = {
-            "Binder": c_wt_pct,
-            "Water": w_wt_pct,
-            "Fine Agg": fine_wt_pct,
-            "Coarse Agg": coarse_wt_pct
-        }
-        
+        pdf_strength = {"strength": final_fcu_28, "ci_low": ci_low, "ci_high": ci_high, "air_penalty": (1.0 - air_penalty_factor) * 100.0, "air_pct": v_void}
+        pdf_slump = {"slump": est_slump_clamped, "class": slump_class}
+        pdf_mass_pcts = {"Binder": c_wt_pct, "Water": w_wt_pct, "Fine Agg": fine_wt_pct, "Coarse Agg": coarse_wt_pct}
+
         try:
-            pdf_bytes = generate_mix_design_pdf(
-                meta_dict=pdf_meta,
-                df_results=df_mix_res,
-                strength_dict=pdf_strength,
-                slump_dict=pdf_slump,
-                mass_pcts=pdf_mass_pcts
-            )
-            
+            pdf_bytes = generate_mix_design_pdf(pdf_meta, df_mix_res, pdf_strength, pdf_slump, pdf_mass_pcts)
             st.download_button(
                 label="📥 Download Concrete Mix Design Report (PDF)",
                 data=pdf_bytes,
-                file_name=f"{cur_job_num}_{mix_sample_label}_mix_design_report.pdf",
+                file_name=f"{cur_job_num}_{mix_sample_label}_mix_report.pdf",
                 mime="application/pdf",
                 type="primary"
             )
@@ -1430,7 +1234,6 @@ with main_tab4:
         filtered_s = df_samples[df_samples["sample_type"] == comp_type]
         st.write(f"Found **{len(filtered_s)}** samples for type: **{comp_type}**")
         st.dataframe(filtered_s, width="stretch")
-        st.caption("⚙️ Multi-sample trend plots, ternary compilation diagrams, and aggregate variability tables will render here.")
     else:
         st.info("No saved database samples available.")
 
@@ -1440,10 +1243,8 @@ with main_tab4:
 with main_tab5:
     st.header("🌐 Geological Google Drive Resources")
     st.info("Connect to Google Drive hosted geological manuals, thin section reference atlases, and standards.")
-    
     st.text_input("Google Drive Folder ID / Share Link", value="https://drive.google.com/drive/folders/placeholder")
     st.button("🔗 Connect to Google Workspace Drive")
-    st.caption("⚙️ PDF reference viewer and aggregate lithology optical reference photos will load here.")
 
 # =========================================================
 # TAB 6: LOCAL DATABASE BROWSER
@@ -1454,7 +1255,6 @@ with main_tab6:
     
     if not df_history.empty:
         st.dataframe(df_history, width="stretch")
-        
         selected_sample = st.selectbox("Select Sample to View Modal Breakdown", df_history["sample_id"].unique(), key="hist_db_sel")
         if selected_sample:
             df_modal_history = load_sample_details(selected_sample)
@@ -1470,35 +1270,32 @@ with main_tab7:
     st.header("ℹ️ Application Guide, Relational DB Schema & Developer Information")
     
     st.markdown("### 📘 Functional Tab Overview & User Guide")
-    
     col_g1, col_g2 = st.columns(2)
     with col_g1:
         st.markdown("""
         * **Tab 1: 🔬 Sample Point Count Analysis**  
-          *Ingest, standardise, and analyse raw optical counter exports.* Upload CSV/TSV counter coordinates ($X, Y\ \mu\text{m}$) or reload previously committed records directly from the database to alter mappings. Generates Van der Plas & Tobi 2-sigma confidence bounds, spatial dispersion indexes ($R$), QAPF ternary classification, and I.S. 465 good vs. bad aggregate ratios.
+          *Ingest, standardize, and analyze raw optical counter coordinates.* Use the split-pane interface to standardise terms and evaluate Van der Plas & Tobi 2-sigma bounds, Clark-Evans spatial dispersion, and I.S. 465 good vs. bad aggregate ratios.
         
         * **Tab 2: ⚖️ Aggregate Density & DB Editor**  
-          *Post-hoc density management & recalculations.* Allows users to inspect any committed geomaterial record, assign or modify phase densities ($\text{g/cm}^3$), calculate mass-based weight percentages ($\text{wt}\%$), and evaluate BS 8500-2 Annex C ASR risk.
+          *Post-hoc density management & spreadsheet recalculations.* Reassign phase densities ($\text{g/cm}^3$) directly inside the interactive spreadsheet grid to update mass-based weight percentages ($\text{wt}\%$) and BS 8500-2 ASR risk ratings.
           
         * **Tab 3: 🏗️ Concrete Mix Design (DB)**  
-          *Mix reverse-engineering & engineering performance predictions.* Converts hardened stereological paste/aggregate/void area fractions into batch weights per $\text{m}^3$ using BS 1881-124 / ASTM C856 mass balance or Powers-Brownyard hydration volume stoichiometry. Features UK DoE 1B cube strength and slump predictions alongside custom ReportLab PDF export.
+          *Mix reverse-engineering & engineering performance predictions.* Converts hardened paste, aggregate, and air void fractions into batch weights per $\text{m}^3$ using BS 1881-124 mass balance or Powers-Brownyard stoichiometry. Generates UK DoE 1B cube strength and slump estimates alongside PDF export.
         """)
     with col_g2:
         st.markdown("""
         * **Tab 4: 📊 Multi-Sample Comparison**  
-          *Comparative cross-sample analytics.* Cross-examine variations, trends, and modal distributions across multiple thin sections belonging to the same project or petrographic grouping.
+          *Cross-sample analytics.* Cross-examine variations and modal distributions across multiple thin sections belonging to the same project or quarry source.
           
         * **Tab 5: 🌐 Geological Drive Resources**  
-          *Cloud repository integration.* Connects directly to Google Workspace Drive folders for rapid reference to standard thin section atlases, optical mineralogy tables, and testing standards.
+          *Cloud repository integration.* Connects to shared Google Drive folders for rapid reference to standard optical atlases and testing protocols.
           
         * **Tab 6: 📁 Local Database Browser**  
-          *Master database record inspection.* Browse parent `samples` and child `modal_results` records, verify integrity, inspect historic data, and review timestamps.
+          *Master database record inspection.* Browse parent `samples` and child `modal_results` records, verify integrity, and inspect historical timestamps.
         """)
         
     st.markdown("---")
     st.markdown("### 🗄️ Relational Database Schema Architecture")
-    st.write("The platform utilises a relational SQLite / PostgreSQL schema linked via `sample_id` with cascading constraints:")
-    
     st.code("""
   +---------------------------------------------------------------------------------+
   |                                  SAMPLES (Master)                               |
@@ -1538,7 +1335,6 @@ with main_tab7:
 
     st.markdown("---")
     st.markdown("### 👨‍💻 About the Developer")
-    
     st.info("""
     **Developer:** **Bradley Staniforth**  
     **Application Purpose:** Designed and engineered as a comprehensive digital laboratory tool for petrographers, materials engineers, and geoscientists to streamline the ingestion, standardization, spatial indexing, regulatory classification (BS 8500-2, I.S. 465, EN 933-11), reverse-engineering, and comparative interpretation of geomaterial point count data.
