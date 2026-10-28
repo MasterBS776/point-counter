@@ -650,6 +650,9 @@ with main_tab2:
 # =========================================================
 # TAB 3: CONCRETE MIX DESIGN ENGINE (APPROACH B & A)
 # =========================================================
+# =========================================================
+# TAB 3: CONCRETE MIX DESIGN ENGINE (APPROACH B & A)
+# =========================================================
 with main_tab3:
     st.header("🏗️ Hardened Concrete Mix Reverse-Engineering & Performance Engine")
     st.info("Back-calculate original concrete mix proportions ($1\\text{ m}^3$), 28-day cube strength (UK DoE 1B), and fresh slump using stereological modal points.")
@@ -686,7 +689,6 @@ with main_tab3:
         st.markdown("---")
         st.subheader("1. Component Classification & Physical Densities")
         
-        # Categorization helper
         def auto_classify(p_name):
             p = str(p_name).lower()
             if any(k in p for k in ["paste", "cement", "binder", "matrix"]):
@@ -708,18 +710,18 @@ with main_tab3:
                     f"Role: **{p_name}** ({row['Vol_Pct']:.1f}%)",
                     ["Cement Paste / Binder", "Fine Aggregate", "Coarse Aggregate", "Air Voids"],
                     index=["Cement Paste / Binder", "Fine Aggregate", "Coarse Aggregate", "Air Voids"].index(def_cat),
-                    key=f"cat_{p_name}"
+                    key=f"cat_{mix_sample_label}_{p_name}"
                 )
                 classifications.append(cat)
                 
         df_mix_input["Role"] = classifications
 
-        v_paste = df_mix_input.loc[df_mix_input["Role"] == "Cement Paste / Binder", "Vol_Pct"].sum()
-        v_fine = df_mix_input.loc[df_mix_input["Role"] == "Fine Aggregate", "Vol_Pct"].sum()
-        v_coarse = df_mix_input.loc[df_mix_input["Role"] == "Coarse Aggregate", "Vol_Pct"].sum()
-        v_void = df_mix_input.loc[df_mix_input["Role"] == "Air Voids", "Vol_Pct"].sum()
+        v_paste = float(df_mix_input.loc[df_mix_input["Role"] == "Cement Paste / Binder", "Vol_Pct"].sum())
+        v_fine = float(df_mix_input.loc[df_mix_input["Role"] == "Fine Aggregate", "Vol_Pct"].sum())
+        v_coarse = float(df_mix_input.loc[df_mix_input["Role"] == "Coarse Aggregate", "Vol_Pct"].sum())
+        v_void = float(df_mix_input.loc[df_mix_input["Role"] == "Air Voids", "Vol_Pct"].sum())
 
-        st.write("##### Consolidated Volumetric Breakdown (Stereological Area % = Vol %)")
+        st.write("##### Consolidated Volumetric Breakdown (Area % = Volume %)")
         b1, b2, b3, b4 = st.columns(4)
         b1.metric("Cement Paste Volume", f"{v_paste:.2f} %")
         b2.metric("Fine Aggregate Volume", f"{v_fine:.2f} %")
@@ -749,7 +751,7 @@ with main_tab3:
                 ["100% CEM I (Portland)", "30% GGBS (Slag)", "25% PFA (Fly Ash)", "7% Silica Fume"]
             )
             d_col1, d_col2, d_col3 = st.columns(3)
-            # Effective binder density based on SCM
+            
             if "GGBS" in scm_type:
                 def_rho_b = 3.07
             elif "PFA" in scm_type:
@@ -759,24 +761,191 @@ with main_tab3:
             else:
                 def_rho_b = 3.15
 
-            rho_cement = d_col1.number_input("Binder Density (g/cm³)", value=float(def_rho_b), step=0.01)
-            rho_fine = d_col2.number_input("Fine Agg Density (g/cm³)", value=2.65, step=0.01)
-            rho_coarse = d_col3.number_input("Coarse Agg Density (g/cm³)", value=2.68, step=0.01)
+            rho_cement = float(d_col1.number_input("Binder Density (g/cm³)", value=float(def_rho_b), step=0.01))
+            rho_fine = float(d_col2.number_input("Fine Agg Density (g/cm³)", value=2.65, step=0.01))
+            rho_coarse = float(d_col3.number_input("Coarse Agg Density (g/cm³)", value=2.68, step=0.01))
 
         # ---------------------------------------------------------
-        # MIX RECONSTRUCTION CALCULATIONS
+        # MIX RECONSTRUCTION CALCULATIONS (CORRECTED UNIT SCALING)
         # ---------------------------------------------------------
-        rho_water = 1.00  # g/cm³ or 1000 kg/m³
+        rho_water = 1.00  # g/cm³ (= 1000 kg/m³ or 1.0 kg/L)
         v_total_agg = v_fine + v_coarse
 
-        # APPROACH B: Absolute Volume Conservation (Mass Balance)
-        c_kg_b = (1.0 - ((v_total_agg + v_void) / 100.0)) / ((1.0 / (rho_cement * 1000.0)) + (wb_ratio / (rho_water * 1000.0)))
+        # APPROACH B: Absolute Volume Conservation (BS 1881-124)
+        # Volume available for fresh paste in 1 m³:
+        v_paste_avail_m3 = max(0.05, 1.0 - ((v_total_agg + v_void) / 100.0))
+        denom_b = (1.0 / (rho_cement * 1000.0)) + (wb_ratio / (rho_water * 1000.0))
+        c_kg_b = v_paste_avail_m3 / denom_b
         w_kg_b = c_kg_b * wb_ratio
-        fine_kg_b = 1000.0 * (v_fine / 100.0) * rho_fine
-        coarse_kg_b = 1000.0 * (v_coarse / 100.0) * rho_coarse
+        fine_kg_b = 10.0 * v_fine * rho_fine
+        coarse_kg_b = 10.0 * v_coarse * rho_coarse
         fresh_density_b = c_kg_b + w_kg_b + fine_kg_b + coarse_kg_b
 
-        # APPROACH A: Powers-Brownyard Hydration Stoichiometry
-        v_c0_pct = v_paste / (1.0 + wb_ratio * (rho_cement / rho_water))
-        c_kg_a = 1000.0 * (v_c0_pct / 100.0) * rho_cement
-        
+        # APPROACH A: Powers-Brownyard Physical Hydration Stoichiometry
+        v_c0_pct = v_paste / (1.0 + wb_ratio * (rho_cement / rho_water)) if (1.0 + wb_ratio * (rho_cement / rho_water)) > 0 else 0
+        c_kg_a = 10.0 * v_c0_pct * rho_cement
+        w_kg_a = c_kg_a * wb_ratio
+        fine_kg_a = 10.0 * v_fine * rho_fine
+        coarse_kg_a = 10.0 * v_coarse * rho_coarse
+        fresh_density_a = c_kg_a + w_kg_a + fine_kg_a + coarse_kg_a
+
+        # Select values based on user toggle
+        is_approach_b = "Approach B" in calc_approach
+        c_kg = c_kg_b if is_approach_b else c_kg_a
+        w_kg = w_kg_b if is_approach_b else w_kg_a
+        fine_kg = fine_kg_b if is_approach_b else fine_kg_a
+        coarse_kg = coarse_kg_b if is_approach_b else coarse_kg_a
+        fresh_density = fresh_density_b if is_approach_b else fresh_density_a
+
+        # Mix Proportions 1 : X
+        prop_c = 1.0
+        prop_fine = fine_kg / c_kg if c_kg > 0 else 0.0
+        prop_coarse = coarse_kg / c_kg if c_kg > 0 else 0.0
+        total_agg_ratio = prop_fine + prop_coarse
+
+        st.markdown("---")
+        st.subheader("3. Reconstructed Mix Proportions (per 1 m³ Batch)")
+
+        df_mix_res = pd.DataFrame({
+            "Constituent": ["Binder (Cementitious)", "Water", "Fine Aggregate", "Coarse Aggregate", "Air Voids"],
+            "Batch Weight (kg/m³)": [
+                f"{c_kg:.1f}", 
+                f"{w_kg:.1f}", 
+                f"{fine_kg:.1f}", 
+                f"{coarse_kg:.1f}", 
+                "0.0"
+            ],
+            "Batch Volume (L/m³)": [
+                f"{(c_kg / rho_cement):.1f}",
+                f"{(w_kg / rho_water):.1f}",
+                f"{(fine_kg / rho_fine):.1f}",
+                f"{(coarse_kg / rho_coarse):.1f}",
+                f"{(v_void * 10.0):.1f}"
+            ],
+            "Mix Proportion (1 : X)": [
+                "1.00",
+                f"{wb_ratio:.2f} (w/b)",
+                f"{prop_fine:.2f}",
+                f"{prop_coarse:.2f}",
+                f"{v_void:.1f}% Air"
+            ]
+        })
+
+        col_res1, col_res2 = st.columns([1.5, 1])
+        with col_res1:
+            st.dataframe(df_mix_res, use_container_width=True)
+
+        with col_res2:
+            st.metric("Total Fresh Density", f"{fresh_density:.0f} kg/m³")
+            st.metric("Paste-to-Aggregate Volume Ratio", f"{(v_paste / v_total_agg):.2f}" if v_total_agg > 0 else "N/A")
+            st.metric("Total Aggregate-to-Binder Ratio", f"1 : {total_agg_ratio:.2f}")
+
+        if not is_approach_b:
+            delta_c = c_kg_a - c_kg_b
+            st.caption(f"ℹ️ **Comparison vs Mass Balance (Approach B):** Binder variance is **{delta_c:+.1f} kg/m³**.")
+        else:
+            delta_c = c_kg_b - c_kg_a
+            st.caption(f"ℹ️ **Comparison vs Powers-Brownyard (Approach A):** Binder variance is **{delta_c:+.1f} kg/m³**.")
+
+        # ---------------------------------------------------------
+        # 4. PERFORMANCE & PROPERTY ESTIMATION
+        # ---------------------------------------------------------
+        st.markdown("---")
+        st.subheader("4. Engineering Performance & Workability Estimator")
+
+        p_tab1, p_tab2 = st.tabs(["Estimated Cube Strength (DoE 1B)", "Original Slump & Admixture 'What-If'"])
+
+        with p_tab1:
+            st.write("##### 28-Day Compressive Cube Strength (UK DoE / BRE Option 1B)")
+            s_col1, s_col2 = st.columns(2)
+            with s_col1:
+                cement_grade = st.selectbox(
+                    "Cement Strength Class:",
+                    ["CEM I 52.5N / 52.5R (High Early Strength)", 
+                     "CEM I 42.5N / 42.5R (Standard Portland)", 
+                     "CEM II 32.5N (Blended/Masonry)"]
+                )
+                coarse_type = st.selectbox("Aggregate Lithological Surface Type:", ["Crushed Rock (Basalt/Limestone/Granite)", "Uncrushed Natural River Gravel"])
+
+            if "52.5" in cement_grade:
+                base_f = 46.0 if "Crushed" in coarse_type else 42.0
+            elif "42.5" in cement_grade:
+                base_f = 39.0 if "Crushed" in coarse_type else 35.0
+            else:
+                base_f = 31.0 if "Crushed" in coarse_type else 27.0
+
+            calc_fcu_28 = base_f - 24.0 * np.log(max(0.20, wb_ratio) / 0.50)
+
+            air_excess = max(0.0, v_void - 1.0)
+            air_penalty_factor = max(0.50, 1.0 - (0.055 * air_excess))
+            final_fcu_28 = max(5.0, calc_fcu_28 * air_penalty_factor)
+
+            with s_col2:
+                st.metric("Estimated 28-Day Cube Strength (fcu, 28)", f"{final_fcu_28:.1f} MPa")
+                ci_low = max(5.0, final_fcu_28 - 4.5)
+                ci_high = final_fcu_28 + 4.5
+                st.info(f"**95% Confidence Interval:** {ci_low:.1f} – {ci_high:.1f} MPa\n\n*Applied Air Void Penalty:* {((1.0 - air_penalty_factor)*100):.1f}% reduction due to {v_void:.1f}% voids.")
+
+        with p_tab2:
+            st.write("##### Original Fresh Slump & Admixture 'What-If' Selector")
+            w_col1, w_col2 = st.columns(2)
+            with w_col1:
+                nom_max_agg = st.selectbox("Coarse Aggregate Maximum Size:", ["20 mm (Standard)", "10 mm", "40 mm"])
+                agg_angularity = st.selectbox("Particle Shape / Angularity:", ["Angular / Crushed Rock", "Sub-rounded / Irregular", "Rounded River Gravel", "Flaky / Elongated"])
+                admixture_scenario = st.selectbox(
+                    "Admixture 'What-If' Scenario:",
+                    ["Plain Concrete (No Water Reducer, beta = 1.00)",
+                     "Normal Water Reducer / Lignosulfonate (8-12% water reduction, beta = 0.90)",
+                     "Mid-Range Plasticizer / SNF (15-20% water reduction, beta = 0.82)",
+                     "High-Range Superplasticizer / PCE (25-35% water reduction, beta = 0.70)"]
+                )
+
+            if "10 mm" in nom_max_agg:
+                w_base = 230.0
+            elif "40 mm" in nom_max_agg:
+                w_base = 190.0
+            else:
+                w_base = 210.0
+
+            if "Rounded" in agg_angularity:
+                w_shape = -20.0
+            elif "Sub-rounded" in agg_angularity:
+                w_shape = -10.0
+            elif "Flaky" in agg_angularity:
+                w_shape = +15.0
+            else:
+                w_shape = 0.0
+
+            p_sand = (v_fine / v_total_agg * 100.0) if v_total_agg > 0 else 35.0
+            w_sand = 0.5 * (p_sand - 35.0)
+
+            if "Lignosulfonate" in admixture_scenario:
+                beta_admix = 0.90
+            elif "Mid-Range" in admixture_scenario:
+                beta_admix = 0.82
+            elif "High-Range" in admixture_scenario:
+                beta_admix = 0.70
+            else:
+                beta_admix = 1.00
+
+            effective_target_water = (w_base + w_shape + w_sand) * beta_admix
+            delta_w = w_kg - effective_target_water
+            est_slump = 50.0 + (2.5 * delta_w)
+
+            if est_slump <= 25:
+                slump_class = "S1 (Very Stiff / Semi-Dry, 10 - 40 mm)"
+            elif 25 < est_slump <= 90:
+                slump_class = "S2 (Medium Workability, 50 - 90 mm)"
+            elif 90 < est_slump <= 150:
+                slump_class = "S3 (High Workability, 100 - 150 mm)"
+            elif 150 < est_slump <= 210:
+                slump_class = "S4 (Very High Workability, 160 - 210 mm)"
+            else:
+                slump_class = "S5 / Collapse (> 220 mm / Flowing Concrete)"
+
+            est_slump_clamped = max(5.0, min(250.0, est_slump))
+
+            with w_col2:
+                st.metric("Estimated Fresh Slump", f"{est_slump_clamped:.0f} mm")
+                st.info(f"**Workability Class:** {slump_class}\n\n*Reference Water Demand:* {effective_target_water:.1f} kg/m³ vs *Actual Reconstructed:* {w_kg:.1f} kg/m³.")
+                
