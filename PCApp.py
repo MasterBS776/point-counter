@@ -168,7 +168,6 @@ def load_all_samples():
     conn.close()
     
     if not df_samples.empty:
-        # Sanitize any columns that could contain corrupted binary buffers
         df_samples["total_points"] = df_samples["total_points"].apply(lambda v: _clean_numeric_val(v, to_float=False))
         df_samples["valid_points"] = df_samples["valid_points"].apply(lambda v: _clean_numeric_val(v, to_float=False))
         df_samples["bounding_area_mm2"] = df_samples["bounding_area_mm2"].apply(lambda v: _clean_numeric_val(v, to_float=True))
@@ -508,41 +507,72 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
 # ---------------------------------------------------------
 # MAIN TAB NAVIGATION
 # ---------------------------------------------------------
-main_tab1, main_tab2, main_tab3, main_tab4, main_tab5, main_tab6 = st.tabs([
+main_tab1, main_tab2, main_tab3, main_tab4, main_tab5, main_tab6, main_tab7 = st.tabs([
     "🔬 Sample Point Count Analysis", 
     "⚖️ Aggregate Density & DB Editor",
     "🏗️ Concrete Mix Design (DB)", 
     "📊 Multi-Sample Comparison", 
     "🌐 Geological Drive Resources",
-    "📁 Local Database Browser"
+    "📁 Local Database Browser",
+    "ℹ️ Application Guide & DB Schema"
 ])
 
 # =========================================================
-# TAB 1: CURRENT SAMPLE ANALYSIS
+# TAB 1: CURRENT SAMPLE ANALYSIS & DB RE-COMMIT
 # =========================================================
 with main_tab1:
-    st.sidebar.header("1. Upload & Job Metadata")
-    uploaded_file = st.sidebar.file_uploader("Upload Point Count File (CSV/TSV)", type=["txt", "tsv", "csv"])
+    st.sidebar.header("1. Sample Source & Job Metadata")
+    
+    input_mode = st.sidebar.radio(
+        "Select Sample Ingestion Mode:",
+        ["Upload New File (CSV/TSV)", "Load Existing Sample from DB"],
+        help="Upload raw counter coordinates or load an already saved record to alter mappings and recommit."
+    )
 
-    job_number = st.sidebar.text_input("Job Number", value="JOB-2026-001")
-    sample_order = st.sidebar.text_input("Sample Order", value="1")
-    sample_type = st.sidebar.selectbox("Sample Type", SAMPLE_TYPES)
-    operator = st.sidebar.text_input("Operator Name", value="Analyst")
+    df_raw = None
+    existing_sample_data = None
+    
+    if input_mode == "Upload New File (CSV/TSV)":
+        uploaded_file = st.sidebar.file_uploader("Upload Point Count File (CSV/TSV)", type=["txt", "tsv", "csv"])
+        job_number = st.sidebar.text_input("Job Number", value="JOB-2026-001")
+        sample_order = st.sidebar.text_input("Sample Order", value="1")
+        sample_type = st.sidebar.selectbox("Sample Type", SAMPLE_TYPES)
+        operator = st.sidebar.text_input("Operator Name", value="Analyst")
+        
+        if uploaded_file is not None:
+            try:
+                df_raw = pd.read_csv(uploaded_file, sep="\t", header=None)
+                if df_raw.shape[1] == 1:
+                    uploaded_file.seek(0)
+                    df_raw = pd.read_csv(uploaded_file, sep=",", header=None)
+                df_raw.columns = ["Image_File", "Point_ID", "X", "Y", "Raw_Term", "Code_ID", "Timestamp"]
+            except Exception as e:
+                st.error(f"Error reading file structure: {e}")
+                st.stop()
+    else:
+        df_samples_db = load_all_samples()
+        if not df_samples_db.empty:
+            sel_sample_id = st.sidebar.selectbox("Select Sample from Database:", df_samples_db["sample_id"].unique())
+            existing_sample_data = df_samples_db[df_samples_db["sample_id"] == sel_sample_id].iloc[0]
+            
+            job_number = st.sidebar.text_input("Job Number", value=str(existing_sample_data["job_number"]))
+            sample_order = st.sidebar.text_input("Sample Order", value=str(existing_sample_data["sample_order"]))
+            
+            def_idx = SAMPLE_TYPES.index(existing_sample_data["sample_type"]) if existing_sample_data["sample_type"] in SAMPLE_TYPES else 0
+            sample_type = st.sidebar.selectbox("Sample Type", SAMPLE_TYPES, index=def_idx)
+            operator = st.sidebar.text_input("Operator Name", value=str(existing_sample_data["operator"]))
+            
+            # Load stored modal results
+            df_modal_loaded = load_sample_details(sel_sample_id)
+        else:
+            st.sidebar.warning("Database has no records yet. Upload a file first.")
+            st.info("👈 No database records found. Please switch to 'Upload New File (CSV/TSV)' in the sidebar.")
 
-    if uploaded_file is not None:
-        try:
-            df_raw = pd.read_csv(uploaded_file, sep="\t", header=None)
-            if df_raw.shape[1] == 1:
-                uploaded_file.seek(0)
-                df_raw = pd.read_csv(uploaded_file, sep=",", header=None)
-            df_raw.columns = ["Image_File", "Point_ID", "X", "Y", "Raw_Term", "Code_ID", "Timestamp"]
-        except Exception as e:
-            st.error(f"Error reading file structure: {e}")
-            st.stop()
-
+    # ------------------ WORKFLOW EXECUTION ------------------
+    if input_mode == "Upload New File (CSV/TSV)" and df_raw is not None:
         st.subheader("📋 Step 1: Ingestion & Metadata Overview")
         col1, col2, col3, col4 = st.columns(4)
-        sample_id = col1.text_input("Sample ID", value=df_raw["Image_File"].iloc[0].split(".")[0])
+        sample_id = col1.text_input("Sample ID", value=str(df_raw["Image_File"].iloc[0]).split(".")[0])
         col2.metric("Job Number", job_number)
         col3.metric("Sample Order", sample_order)
         col4.metric("Total Gross Points", len(df_raw))
@@ -744,7 +774,7 @@ with main_tab1:
                     phase_n = row["Standardized_Phase"]
                     def_d = DEFAULT_DENSITIES.get(phase_n, 2.65)
                     with d_cols[idx % len(d_cols)]:
-                        d_val = st.number_input(f"Density: {phase_n}", value=def_d, step=0.05, key=f"d_{phase_n}")
+                        d_val = st.number_input(f"Density: {phase_n}", value=def_d, step=0.05, key=f"d_up_{phase_n}")
                         densities.append(d_val)
                 
                 summary["Density (g/cm³)"] = densities
@@ -815,8 +845,81 @@ with main_tab1:
             file_name=f"{job_number}_{sample_id}_modal_report.csv",
             mime="text/csv"
         )
+        
+    elif input_mode == "Load Existing Sample from DB" and existing_sample_data is not None:
+        # Load & Edit Existing Database Sample
+        st.subheader(f"📋 Editing Stored Record: {existing_sample_data['sample_id']}")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        sample_id = col1.text_input("Sample ID (Primary Key)", value=str(existing_sample_data["sample_id"]), disabled=True)
+        col2.metric("Job Number", job_number)
+        col3.metric("Sample Order", sample_order)
+        col4.metric("Gross Points in DB", int(existing_sample_data["total_points"]))
+
+        cur_litho = str(existing_sample_data.get("lithology_code", ""))
+        def_lith_idx = IS465_LITHOLOGY_CODES.index(cur_litho) if cur_litho in IS465_LITHOLOGY_CODES else 0
+        
+        litho_tag = ""
+        if sample_type == "Concrete - I.S.465":
+            litho_tag = st.selectbox("I.S. 465 Main Aggregate Lithology Tag", IS465_LITHOLOGY_CODES, index=def_lith_idx)
+
+        st.markdown("---")
+        st.subheader("🛠️ Stored Modal Phases & Re-mapping")
+        
+        df_modal_edit = df_modal_loaded.copy()
+        
+        # Phase renaming and editing
+        st.write("Modify phase names or point values below:")
+        e_cols = st.columns(min(len(df_modal_edit), 3))
+        new_names = []
+        for idx, row in df_modal_edit.iterrows():
+            with e_cols[idx % len(e_cols)]:
+                n_name = st.text_input(f"Phase #{idx+1}", value=row["phase_name"], key=f"re_p_{idx}")
+                new_names.append(n_name)
+        df_modal_edit["phase_name"] = new_names
+        
+        # Recalculate percentages
+        valid_tot = df_modal_edit["point_count"].sum()
+        df_modal_edit["modal_percent"] = (df_modal_edit["point_count"] / valid_tot * 100.0).round(2)
+        p = df_modal_edit["modal_percent"] / 100.0
+        df_modal_edit["std_error"] = (2 * np.sqrt((p * (1 - p)) / valid_tot) * 100.0).round(2)
+        
+        if sample_type in ["Aggregates", "Aggregate - Recycled", "Rock"]:
+            df_modal_edit["abundance"] = df_modal_edit["modal_percent"].apply(classify_abundance)
+
+        col_t, col_c = st.columns([1.2, 1])
+        with col_t:
+            st.dataframe(df_modal_edit[["phase_name", "point_count", "modal_percent", "std_error", "abundance"]], width="stretch")
+        with col_c:
+            fig_edit = px.bar(df_modal_edit, x="phase_name", y="modal_percent", color="phase_name", title="Modal Composition")
+            st.plotly_chart(fig_edit, width="stretch")
+
+        st.session_state["active_sample_id"] = sample_id
+        st.session_state["active_summary"] = df_modal_edit.rename(columns={"phase_name": "Standardized_Phase", "modal_percent": "Modal_Percent (%)"}).copy()
+        st.session_state["active_job_number"] = job_number
+        st.session_state["active_sample_order"] = sample_order
+        st.session_state["active_operator"] = operator
+
+        st.markdown("---")
+        st.subheader("💾 Update & Recommit to Database")
+        
+        if st.button("💾 Update & Recommit Sample to Database", type="primary"):
+            meta_recommit = {
+                "sample_id": sample_id,
+                "job_number": job_number,
+                "sample_order": sample_order,
+                "sample_type": sample_type,
+                "operator": operator,
+                "total_points": existing_sample_data["total_points"],
+                "valid_points": valid_tot,
+                "area_mm2": existing_sample_data["bounding_area_mm2"],
+                "linear_traverse_mm": existing_sample_data["linear_traverse_mm"],
+                "lithology_code": litho_tag
+            }
+            save_sample_to_db(meta_recommit, df_modal_edit)
+            st.success(f"Sample '{sample_id}' successfully updated and recommitted to the database!")
     else:
-        st.info("👈 Please upload a point count CSV/TSV file from the sidebar to begin analysis.")
+        st.info("👈 Please upload a point count file or choose a database sample from the left sidebar to begin.")
 
 # =========================================================
 # TAB 2: AGGREGATE DENSITY & DB RE-EVALUATION EDITOR
@@ -855,7 +958,6 @@ with main_tab2:
             st.write("##### Updated Modal & Weight Percentage Table")
             st.dataframe(df_details[["phase_name", "point_count", "modal_percent", "density_gcm3", "wt_percent", "abundance"]], width="stretch")
 
-            # Re-evaluate BS 8500 ASR Risk
             df_details_eval = df_details.rename(columns={"phase_name": "Standardized_Phase", "modal_percent": "Modal_Percent (%)"})
             re_asr_risk, re_asr_desc = evaluate_asr_risk(df_details_eval)
             st.metric("Re-evaluated BS 8500-2 Annex C ASR Risk", re_asr_risk)
@@ -1360,4 +1462,84 @@ with main_tab6:
             st.dataframe(df_modal_history, width="stretch")
     else:
         st.info("No saved samples found in the local database yet.")
+
+# =========================================================
+# TAB 7: APPLICATION GUIDE, DB SCHEMA & DEVELOPER INFO
+# =========================================================
+with main_tab7:
+    st.header("ℹ️ Application Guide, Relational DB Schema & Developer Information")
+    
+    st.markdown("### 📘 Functional Tab Overview & User Guide")
+    
+    col_g1, col_g2 = st.columns(2)
+    with col_g1:
+        st.markdown("""
+        * **Tab 1: 🔬 Sample Point Count Analysis**  
+          *Ingest, standardise, and analyse raw optical counter exports.* Upload CSV/TSV counter coordinates ($X, Y\ \mu\text{m}$) or reload previously committed records directly from the database to alter mappings. Generates Van der Plas & Tobi 2-sigma confidence bounds, spatial dispersion indexes ($R$), QAPF ternary classification, and I.S. 465 good vs. bad aggregate ratios.
         
+        * **Tab 2: ⚖️ Aggregate Density & DB Editor**  
+          *Post-hoc density management & recalculations.* Allows users to inspect any committed geomaterial record, assign or modify phase densities ($\text{g/cm}^3$), calculate mass-based weight percentages ($\text{wt}\%$), and evaluate BS 8500-2 Annex C ASR risk.
+          
+        * **Tab 3: 🏗️ Concrete Mix Design (DB)**  
+          *Mix reverse-engineering & engineering performance predictions.* Converts hardened stereological paste/aggregate/void area fractions into batch weights per $\text{m}^3$ using BS 1881-124 / ASTM C856 mass balance or Powers-Brownyard hydration volume stoichiometry. Features UK DoE 1B cube strength and slump predictions alongside custom ReportLab PDF export.
+        """)
+    with col_g2:
+        st.markdown("""
+        * **Tab 4: 📊 Multi-Sample Comparison**  
+          *Comparative cross-sample analytics.* Cross-examine variations, trends, and modal distributions across multiple thin sections belonging to the same project or petrographic grouping.
+          
+        * **Tab 5: 🌐 Geological Drive Resources**  
+          *Cloud repository integration.* Connects directly to Google Workspace Drive folders for rapid reference to standard thin section atlases, optical mineralogy tables, and testing standards.
+          
+        * **Tab 6: 📁 Local Database Browser**  
+          *Master database record inspection.* Browse parent `samples` and child `modal_results` records, verify integrity, inspect historic data, and review timestamps.
+        """)
+        
+    st.markdown("---")
+    st.markdown("### 🗄️ Relational Database Schema Architecture")
+    st.write("The platform utilises a relational SQLite / PostgreSQL schema linked via `sample_id` with cascading constraints:")
+    
+    st.code("""
+  +---------------------------------------------------------------------------------+
+  |                                  SAMPLES (Master)                               |
+  +---------------------------------------------------------------------------------+
+  | sample_id (PK)         : VARCHAR(100) -> Unique sample identifier               |
+  | job_number             : VARCHAR(100) -> Job / Project QC tracking code         |
+  | sample_order           : VARCHAR(50)  -> Sequential order / thin section ID     |
+  | sample_type            : VARCHAR(100) -> Aggregates, Concrete, Rock, etc.       |
+  | operator               : VARCHAR(100) -> Analyst name                           |
+  | total_points           : INTEGER      -> Total gross points counted             |
+  | valid_points           : INTEGER      -> Points excluding "NA"                  |
+  | bounding_area_mm2      : REAL         -> Calculated thin section area (mm²)     |
+  | linear_traverse_mm     : REAL         -> Total traverse length (mm)             |
+  | lithology_code         : VARCHAR(50)  -> 3-letter I.S. 465 code (e.g., MCM)     |
+  | created_at             : TIMESTAMP    -> Date & time of commitment              |
+  +---------------------------------------------------------------------------------+
+                                           |
+                                           | 1 : N (One-to-Many Relationship)
+                                           v
+  +---------------------------------------------------------------------------------+
+  |                               MODAL_RESULTS (Child)                             |
+  +---------------------------------------------------------------------------------+
+  | id (PK)                : INTEGER AUTOINCREMENT / SERIAL                         |
+  | sample_id (FK)         : VARCHAR(100) -> Foreign Key references SAMPLES        |
+  | phase_name             : VARCHAR(100) -> Standardized mineral/phase name        |
+  | point_count            : INTEGER      -> Raw points attributed to this phase    |
+  | modal_percent          : REAL         -> Stereological volume percentage (vol%) |
+  | std_error              : REAL         -> 2-Sigma confidence interval (±%)       |
+  | abundance              : VARCHAR(50)  -> Major, Minor, or Trace classification  |
+  | density_gcm3           : REAL         -> Assigned specific density (g/cm³)      |
+  | wt_percent             : REAL         -> Recalculated mass percentage (wt%)     |
+  | en933_class            : VARCHAR(100) -> Recycled aggregate class (Rc, Ru, etc)|
+  | carbonation            : VARCHAR(50)  -> Carbonation state                      |
+  | liberation             : VARCHAR(50)  -> Particle liberation index              |
+  +---------------------------------------------------------------------------------+
+    """, language="text")
+
+    st.markdown("---")
+    st.markdown("### 👨‍💻 About the Developer")
+    
+    st.info("""
+    **Developer:** **Bradley Staniforth**  
+    **Application Purpose:** Designed and engineered as a comprehensive digital laboratory tool for petrographers, materials engineers, and geoscientists to streamline the ingestion, standardization, spatial indexing, regulatory classification (BS 8500-2, I.S. 465, EN 933-11), reverse-engineering, and comparative interpretation of geomaterial point count data.
+    """)
