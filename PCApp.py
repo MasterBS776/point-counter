@@ -86,12 +86,13 @@ SCALE_UM_PER_PX = 1.82  # 1.82 microns per pixel
 DB_FILE = "petrography_data.db"
 
 # ---------------------------------------------------------
-# 0. DATABASE PERSISTENCE & AUTO-MIGRATION MODULE
+# 0. DATABASE PERSISTENCE & AUTO-MIGRATION MODULE (5 TABLES)
 # ---------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
+    # 1. Base Master Samples Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS samples (
             sample_id TEXT PRIMARY KEY,
@@ -103,16 +104,30 @@ def init_db():
             valid_points INTEGER,
             bounding_area_mm2 REAL,
             linear_traverse_mm REAL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            traverses_y_count INTEGER,
+            transects_x_count INTEGER,
+            traverse_spacing_um REAL,
+            lithology_code TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     
-    try:
-        cursor.execute("ALTER TABLE samples ADD COLUMN lithology_code TEXT;")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
+    # Migrations for existing samples tables
+    for col, c_type in [
+        ("lithology_code", "TEXT"),
+        ("traverses_y_count", "INTEGER"),
+        ("transects_x_count", "INTEGER"),
+        ("traverse_spacing_um", "REAL"),
+        ("updated_at", "TIMESTAMP")
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE samples ADD COLUMN {col} {c_type};")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
+    # 2. Child Table: Modal Phase Results (1:N)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS modal_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,24 +137,93 @@ def init_db():
             modal_percent REAL,
             std_error REAL,
             abundance TEXT,
+            density_gcm3 REAL,
+            wt_percent REAL,
+            functional_role TEXT,
             en933_class TEXT,
             carbonation TEXT,
             liberation TEXT,
-            FOREIGN KEY(sample_id) REFERENCES samples(sample_id)
+            FOREIGN KEY(sample_id) REFERENCES samples(sample_id) ON DELETE CASCADE
         )
     """)
     
-    try:
-        cursor.execute("ALTER TABLE modal_results ADD COLUMN density_gcm3 REAL;")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
+    for col, c_type in [
+        ("density_gcm3", "REAL"),
+        ("wt_percent", "REAL"),
+        ("functional_role", "TEXT")
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE modal_results ADD COLUMN {col} {c_type};")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
-    try:
-        cursor.execute("ALTER TABLE modal_results ADD COLUMN wt_percent REAL;")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
+    # 3. Child Table: Petrographic QC & Spatial Metrics (1:1)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS petro_qc_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sample_id TEXT UNIQUE,
+            clark_evans_r REAL,
+            dispersion_pattern TEXT,
+            asr_risk_rating TEXT,
+            asr_risk_description TEXT,
+            is465_total_agg_pct REAL,
+            is465_good_agg_pct REAL,
+            is465_bad_agg_pct REAL,
+            qapf_norm_q REAL,
+            qapf_norm_a REAL,
+            qapf_norm_p REAL,
+            calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(sample_id) REFERENCES samples(sample_id) ON DELETE CASCADE
+        )
+    """)
+
+    # 4. Child Table: Concrete Mix Designs (1:N Versioned)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS concrete_mix_designs (
+            mix_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sample_id TEXT,
+            version_number INTEGER DEFAULT 1,
+            calculation_approach TEXT,
+            estimated_wb_ratio REAL,
+            main_binder_type TEXT,
+            pct_main_binder REAL,
+            pct_ggbs REAL DEFAULT 0.0,
+            pct_pfa REAL DEFAULT 0.0,
+            pct_microsilica REAL DEFAULT 0.0,
+            pct_metakaolin REAL DEFAULT 0.0,
+            effective_binder_density REAL,
+            fresh_density_kgm3 REAL,
+            total_agg_to_binder_ratio REAL,
+            cement_grade_selected TEXT,
+            coarse_texture_selected TEXT,
+            estimated_cube_strength_mpa REAL,
+            strength_ci_low_mpa REAL,
+            strength_ci_high_mpa REAL,
+            air_penalty_applied_pct REAL,
+            admixture_scenario TEXT,
+            estimated_slump_mm REAL,
+            slump_class TEXT,
+            committed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(sample_id) REFERENCES samples(sample_id) ON DELETE CASCADE
+        )
+    """)
+
+    # 5. Grandchild Table: Mix Design Constituent Breakdown (1:N)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mix_design_breakdown (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mix_id INTEGER,
+            sample_id TEXT,
+            constituent TEXT,
+            batch_weight_kgm3 REAL,
+            batch_volume_lm3 REAL,
+            mass_percent REAL,
+            volume_percent REAL,
+            mix_proportion_ratio REAL,
+            FOREIGN KEY(mix_id) REFERENCES concrete_mix_designs(mix_id) ON DELETE CASCADE
+        )
+    """)
 
     conn.commit()
     conn.close()
@@ -165,27 +249,49 @@ def _clean_numeric_val(val, to_float=False):
     except (ValueError, TypeError):
         return 0.0 if to_float else 0
 
-def save_sample_to_db(sample_meta, df_summary):
+def save_sample_to_db(sample_meta, df_summary, qc_metrics=None):
+    """Saves master sample, child modal results, and petro QC metrics atomically."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
+    # 1. Upsert Parent Record
     cursor.execute("""
-        INSERT OR REPLACE INTO samples 
-        (sample_id, job_number, sample_order, sample_type, operator, total_points, valid_points, bounding_area_mm2, linear_traverse_mm, lithology_code)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO samples 
+        (sample_id, job_number, sample_order, sample_type, operator, total_points, valid_points, 
+         bounding_area_mm2, linear_traverse_mm, traverses_y_count, transects_x_count, 
+         traverse_spacing_um, lithology_code, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(sample_id) DO UPDATE SET
+            job_number = excluded.job_number,
+            sample_order = excluded.sample_order,
+            sample_type = excluded.sample_type,
+            operator = excluded.operator,
+            total_points = excluded.total_points,
+            valid_points = excluded.valid_points,
+            bounding_area_mm2 = excluded.bounding_area_mm2,
+            linear_traverse_mm = excluded.linear_traverse_mm,
+            traverses_y_count = excluded.traverses_y_count,
+            transects_x_count = excluded.transects_x_count,
+            traverse_spacing_um = excluded.traverse_spacing_um,
+            lithology_code = excluded.lithology_code,
+            updated_at = CURRENT_TIMESTAMP
     """, (
         str(sample_meta["sample_id"]),
         str(sample_meta["job_number"]),
         str(sample_meta["sample_order"]),
         str(sample_meta["sample_type"]),
         str(sample_meta["operator"]),
-        int(_clean_numeric_val(sample_meta["total_points"], to_float=False)),
-        int(_clean_numeric_val(sample_meta["valid_points"], to_float=False)),
-        float(_clean_numeric_val(sample_meta["area_mm2"], to_float=True)),
-        float(_clean_numeric_val(sample_meta["linear_traverse_mm"], to_float=True)),
+        int(_clean_numeric_val(sample_meta.get("total_points", 0), to_float=False)),
+        int(_clean_numeric_val(sample_meta.get("valid_points", 0), to_float=False)),
+        float(_clean_numeric_val(sample_meta.get("area_mm2", 0.0), to_float=True)),
+        float(_clean_numeric_val(sample_meta.get("linear_traverse_mm", 0.0), to_float=True)),
+        int(_clean_numeric_val(sample_meta.get("traverses_y_count", 0), to_float=False)),
+        int(_clean_numeric_val(sample_meta.get("transects_x_count", 0), to_float=False)),
+        float(_clean_numeric_val(sample_meta.get("traverse_spacing_um", 0.0), to_float=True)),
         str(sample_meta.get("lithology_code", ""))
     ))
     
+    # 2. Re-populate Modal Results
     cursor.execute("DELETE FROM modal_results WHERE sample_id = ?", (str(sample_meta["sample_id"]),))
     
     for _, row in df_summary.iterrows():
@@ -203,8 +309,8 @@ def save_sample_to_db(sample_meta, df_summary):
 
         cursor.execute("""
             INSERT INTO modal_results 
-            (sample_id, phase_name, point_count, modal_percent, std_error, abundance, density_gcm3, wt_percent, en933_class, carbonation, liberation)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (sample_id, phase_name, point_count, modal_percent, std_error, abundance, density_gcm3, wt_percent, functional_role, en933_class, carbonation, liberation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             str(sample_meta["sample_id"]),
             p_name,
@@ -214,13 +320,114 @@ def save_sample_to_db(sample_meta, df_summary):
             str(abun) if abun is not None else None,
             d_val,
             wt_val,
+            str(row.get("Role", row.get("functional_role", ""))) or None,
             str(row.get("EN933_Class", row.get("en933_class", ""))) or None,
             str(row.get("Carbonation", row.get("carbonation", ""))) or None,
             str(row.get("Liberation", row.get("liberation", ""))) or None
         ))
+
+    # 3. Upsert Petro QC & Spatial Metrics (1:1)
+    if qc_metrics:
+        cursor.execute("""
+            INSERT INTO petro_qc_metrics 
+            (sample_id, clark_evans_r, dispersion_pattern, asr_risk_rating, asr_risk_description,
+             is465_total_agg_pct, is465_good_agg_pct, is465_bad_agg_pct, qapf_norm_q, qapf_norm_a, qapf_norm_p, calculated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(sample_id) DO UPDATE SET
+                clark_evans_r = excluded.clark_evans_r,
+                dispersion_pattern = excluded.dispersion_pattern,
+                asr_risk_rating = excluded.asr_risk_rating,
+                asr_risk_description = excluded.asr_risk_description,
+                is465_total_agg_pct = excluded.is465_total_agg_pct,
+                is465_good_agg_pct = excluded.is465_good_agg_pct,
+                is465_bad_agg_pct = excluded.is465_bad_agg_pct,
+                qapf_norm_q = excluded.qapf_norm_q,
+                qapf_norm_a = excluded.qapf_norm_a,
+                qapf_norm_p = excluded.qapf_norm_p,
+                calculated_at = CURRENT_TIMESTAMP
+        """, (
+            str(sample_meta["sample_id"]),
+            qc_metrics.get("clark_evans_r"),
+            qc_metrics.get("dispersion_pattern"),
+            qc_metrics.get("asr_risk_rating"),
+            qc_metrics.get("asr_risk_description"),
+            qc_metrics.get("is465_total_agg_pct"),
+            qc_metrics.get("is465_good_agg_pct"),
+            qc_metrics.get("is465_bad_agg_pct"),
+            qc_metrics.get("qapf_norm_q"),
+            qc_metrics.get("qapf_norm_a"),
+            qc_metrics.get("qapf_norm_p")
+        ))
         
     conn.commit()
     conn.close()
+
+def save_concrete_mix_design_to_db(mix_payload, df_breakdown):
+    """Saves a versioned concrete mix design scenario and its batch constituents."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    sample_id = str(mix_payload["sample_id"])
+    
+    # Calculate next version number for this sample
+    cursor.execute("SELECT COALESCE(MAX(version_number), 0) + 1 FROM concrete_mix_designs WHERE sample_id = ?", (sample_id,))
+    next_ver = cursor.fetchone()[0]
+    
+    cursor.execute("""
+        INSERT INTO concrete_mix_designs 
+        (sample_id, version_number, calculation_approach, estimated_wb_ratio, main_binder_type,
+         pct_main_binder, pct_ggbs, pct_pfa, pct_microsilica, pct_metakaolin,
+         effective_binder_density, fresh_density_kgm3, total_agg_to_binder_ratio,
+         cement_grade_selected, coarse_texture_selected, estimated_cube_strength_mpa,
+         strength_ci_low_mpa, strength_ci_high_mpa, air_penalty_applied_pct,
+         admixture_scenario, estimated_slump_mm, slump_class, committed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    """, (
+        sample_id,
+        next_ver,
+        mix_payload["calculation_approach"],
+        float(mix_payload["estimated_wb_ratio"]),
+        mix_payload["main_binder_type"],
+        float(mix_payload["pct_main_binder"]),
+        float(mix_payload.get("pct_ggbs", 0.0)),
+        float(mix_payload.get("pct_pfa", 0.0)),
+        float(mix_payload.get("pct_microsilica", 0.0)),
+        float(mix_payload.get("pct_metakaolin", 0.0)),
+        float(mix_payload["effective_binder_density"]),
+        float(mix_payload["fresh_density_kgm3"]),
+        float(mix_payload["total_agg_to_binder_ratio"]),
+        mix_payload.get("cement_grade_selected", ""),
+        mix_payload.get("coarse_texture_selected", ""),
+        float(mix_payload.get("estimated_cube_strength_mpa", 0.0)),
+        float(mix_payload.get("strength_ci_low_mpa", 0.0)),
+        float(mix_payload.get("strength_ci_high_mpa", 0.0)),
+        float(mix_payload.get("air_penalty_applied_pct", 0.0)),
+        mix_payload.get("admixture_scenario", ""),
+        float(mix_payload.get("estimated_slump_mm", 0.0)),
+        mix_payload.get("slump_class", "")
+    ))
+    
+    mix_id = cursor.lastrowid
+    
+    # Insert constituent lines into mix_design_breakdown
+    for _, row in df_breakdown.iterrows():
+        cursor.execute("""
+            INSERT INTO mix_design_breakdown 
+            (mix_id, sample_id, constituent, batch_weight_kgm3, batch_volume_lm3, mass_percent, volume_percent, mix_proportion_ratio)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            mix_id,
+            sample_id,
+            str(row["Constituent"]),
+            float(_clean_numeric_val(row["Batch Weight (kg/m³)"].replace(" kg/m³", "") if isinstance(row["Batch Weight (kg/m³)"], str) else row["Batch Weight (kg/m³)"], to_float=True)),
+            float(_clean_numeric_val(row["Batch Volume (L/m³)"].replace(" L/m³", "") if isinstance(row["Batch Volume (L/m³)"], str) else row["Batch Volume (L/m³)"], to_float=True)),
+            float(_clean_numeric_val(row["Determined Mass % (wt%)"].replace("%", "") if isinstance(row["Determined Mass % (wt%)"], str) else row["Determined Mass % (wt%)"], to_float=True)),
+            float(_clean_numeric_val(row["Determined Vol %"].replace("%", "") if isinstance(row["Determined Vol %"], str) else row["Determined Vol %"], to_float=True)),
+            float(_clean_numeric_val(row["Mix Proportion (1 : X)"].split()[0] if isinstance(row["Mix Proportion (1 : X)"], str) and row["Mix Proportion (1 : X)"][0].isdigit() else 0.0, to_float=True))
+        ))
+        
+    conn.commit()
+    conn.close()
+    return next_ver
 
 def load_all_samples():
     conn = sqlite3.connect(DB_FILE)
@@ -228,12 +435,15 @@ def load_all_samples():
     conn.close()
     
     if not df_samples.empty:
-        df_samples["total_points"] = df_samples["total_points"].apply(lambda v: _clean_numeric_val(v, to_float=False))
-        df_samples["valid_points"] = df_samples["valid_points"].apply(lambda v: _clean_numeric_val(v, to_float=False))
-        df_samples["bounding_area_mm2"] = df_samples["bounding_area_mm2"].apply(lambda v: _clean_numeric_val(v, to_float=True))
-        df_samples["linear_traverse_mm"] = df_samples["linear_traverse_mm"].apply(lambda v: _clean_numeric_val(v, to_float=True))
-        
-        for col in ["sample_id", "job_number", "sample_order", "sample_type", "operator", "lithology_code", "created_at"]:
+        for num_col in ["total_points", "valid_points", "traverses_y_count", "transects_x_count"]:
+            if num_col in df_samples.columns:
+                df_samples[num_col] = df_samples[num_col].apply(lambda v: _clean_numeric_val(v, to_float=False))
+                
+        for float_col in ["bounding_area_mm2", "linear_traverse_mm", "traverse_spacing_um"]:
+            if float_col in df_samples.columns:
+                df_samples[float_col] = df_samples[float_col].apply(lambda v: _clean_numeric_val(v, to_float=True))
+                
+        for col in ["sample_id", "job_number", "sample_order", "sample_type", "operator", "lithology_code", "created_at", "updated_at"]:
             if col in df_samples.columns:
                 df_samples[col] = df_samples[col].astype(str)
                 
@@ -251,11 +461,23 @@ def load_sample_details(sample_id):
         df_results["density_gcm3"] = df_results["density_gcm3"].apply(lambda v: _clean_numeric_val(v, to_float=True) if pd.notnull(v) else np.nan)
         df_results["wt_percent"] = df_results["wt_percent"].apply(lambda v: _clean_numeric_val(v, to_float=True) if pd.notnull(v) else np.nan)
         
-        for col in ["phase_name", "abundance", "en933_class", "carbonation", "liberation"]:
+        for col in ["phase_name", "abundance", "functional_role", "en933_class", "carbonation", "liberation"]:
             if col in df_results.columns:
                 df_results[col] = df_results[col].astype(str).replace({"None": "", "nan": ""})
                 
     return df_results
+
+def load_qc_metrics(sample_id):
+    conn = sqlite3.connect(DB_FILE)
+    df_qc = pd.read_sql_query("SELECT * FROM petro_qc_metrics WHERE sample_id = ?", conn, params=(str(sample_id),))
+    conn.close()
+    return df_qc.iloc[0].to_dict() if not df_qc.empty else {}
+
+def load_saved_mix_designs(sample_id):
+    conn = sqlite3.connect(DB_FILE)
+    df_mixes = pd.read_sql_query("SELECT * FROM concrete_mix_designs WHERE sample_id = ? ORDER BY version_number DESC", conn, params=(str(sample_id),))
+    conn.close()
+    return df_mixes
 
 # ---------------------------------------------------------
 # 1. SAMPLE TYPES, TAXONOMY & CODES
@@ -805,6 +1027,7 @@ with main_tab1:
         num_traverses = len(unique_y)
         num_transects = len(unique_x)
         total_linear_traverse_mm = num_traverses * width_mm
+        traverse_pitch_um = float(np.mean(np.diff(unique_x))) if len(unique_x) > 1 else 0.0
 
         left_pane, right_pane = st.columns([4, 6])
         
@@ -885,6 +1108,9 @@ with main_tab1:
                         "valid_points": valid_points_count,
                         "area_mm2": area_mm2,
                         "linear_traverse_mm": total_linear_traverse_mm,
+                        "traverses_y_count": num_traverses,
+                        "transects_x_count": num_transects,
+                        "traverse_spacing_um": traverse_pitch_um,
                         "lithology_code": litho_tag
                     }
                     if sample_type == "Aggregate - Recycled" and tagging_data:
@@ -893,9 +1119,9 @@ with main_tab1:
                     else:
                         summary_save = summary
                         
-                    save_sample_to_db(meta_payload, summary_save)
+                    save_sample_to_db(meta_payload, summary_save, st.session_state.get("active_qc_metrics_payload"))
                     st.session_state["is_db_committed"] = True
-                    st.success(f"Sample '{sample_id}' committed to database!")
+                    st.success(f"Sample '{sample_id}' and all QC metrics committed to database!")
 
         with right_pane:
             st.subheader("📊 Live Analytical Viewport")
@@ -946,6 +1172,24 @@ with main_tab1:
                 "Clark-Evans Ratio (R)": f"{R_val:.3f} ({R_desc})" if R_val else "N/A"
             }
 
+            qc_metrics_payload = {
+                "clark_evans_r": float(R_val) if R_val is not None else None,
+                "dispersion_pattern": R_desc if R_val is not None else None,
+                "asr_risk_rating": None,
+                "asr_risk_description": None,
+                "is465_total_agg_pct": None,
+                "is465_good_agg_pct": None,
+                "is465_bad_agg_pct": None,
+                "qapf_norm_q": None,
+                "qapf_norm_a": None,
+                "qapf_norm_p": None
+            }
+
+            # Evaluate ASR
+            asr_res, asr_txt = evaluate_asr_risk(summary)
+            qc_metrics_payload["asr_risk_rating"] = asr_res
+            qc_metrics_payload["asr_risk_description"] = asr_txt
+
             with tab_plot3:
                 if sample_type == "Concrete - I.S.465":
                     good_agg_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Good Aggregate", case=False), "Point_Count"].sum()
@@ -965,6 +1209,10 @@ with main_tab1:
                         specific_metrics["Total Aggregate %"] = f"{total_agg_pct:.2f}%"
                         specific_metrics["Good Aggregate % of Total"] = f"{pct_good_of_agg:.1f}%"
                         specific_metrics["Bad Aggregate % of Total"] = f"{pct_bad_of_agg:.1f}%"
+
+                        qc_metrics_payload["is465_total_agg_pct"] = float(total_agg_pct)
+                        qc_metrics_payload["is465_good_agg_pct"] = float(pct_good_of_agg)
+                        qc_metrics_payload["is465_bad_agg_pct"] = float(pct_bad_of_agg)
                 elif sample_type in ["Rock", "Aggregates"]:
                     q_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Quartz", case=False), "Point_Count"].sum()
                     a_cnt = summary.loc[summary["Standardized_Phase"].str.contains("K-Feldspar|Alkali", case=False), "Point_Count"].sum()
@@ -985,8 +1233,14 @@ with main_tab1:
                         })
                         st.plotly_chart(fig_ternary, width="stretch")
                         specific_metrics["QAPF Normalized Q / A / P"] = f"{norm_q:.1f}% / {norm_a:.1f}% / {norm_p:.1f}%"
+
+                        qc_metrics_payload["qapf_norm_q"] = float(norm_q)
+                        qc_metrics_payload["qapf_norm_a"] = float(norm_a)
+                        qc_metrics_payload["qapf_norm_p"] = float(norm_p)
                 else:
                     st.info("No specific standard derived parameters for this material type.")
+
+            st.session_state["active_qc_metrics_payload"] = qc_metrics_payload
 
             # Tab 1 PDF Download Button in left pane
             with c_btn2:
@@ -1057,6 +1311,9 @@ with main_tab1:
                         "valid_points": valid_tot,
                         "area_mm2": existing_sample_data["bounding_area_mm2"],
                         "linear_traverse_mm": existing_sample_data["linear_traverse_mm"],
+                        "traverses_y_count": existing_sample_data.get("traverses_y_count", 0),
+                        "transects_x_count": existing_sample_data.get("transects_x_count", 0),
+                        "traverse_spacing_um": existing_sample_data.get("traverse_spacing_um", 0.0),
                         "lithology_code": litho_tag
                     }
                     save_sample_to_db(meta_recommit, df_modal_edit)
@@ -1179,13 +1436,18 @@ with main_tab2:
                     "liberation": "Liberation"
                 })
                 
-                save_sample_to_db(meta_update, df_details_to_save)
-                st.success(f"Sample '{selected_db_id}' successfully updated in database!")
+                # Also commit updated ASR metric
+                qc_current = load_qc_metrics(selected_db_id)
+                qc_current["asr_risk_rating"] = re_asr_risk
+                qc_current["asr_risk_description"] = re_asr_desc
+                
+                save_sample_to_db(meta_update, df_details_to_save, qc_current)
+                st.success(f"Sample '{selected_db_id}' and updated ASR metrics committed to database!")
     else:
         st.info("No saved samples available in the database to edit yet.")
 
 # =========================================================
-# TAB 3: BENTO GRID CONCRETE MIX DESIGN ENGINE
+# TAB 3: BENTO GRID CONCRETE MIX DESIGN ENGINE (VERSIONED)
 # =========================================================
 with main_tab3:
     st.header("🏗️ Hardened Concrete Mix Reverse-Engineering & Performance Engine")
@@ -1465,29 +1727,60 @@ with main_tab3:
             </div>
             """, unsafe_allow_html=True)
 
-        # PDF Export
+        # Dedicated Save Concrete Mix Scenario to DB Button
         st.markdown("---")
-        pdf_meta = {
-            "sample_id": mix_sample_label, "job_number": cur_job_num, "sample_order": cur_sample_ord,
-            "operator": cur_op_name, "approach": "Approach B (Mass Balance)" if is_approach_b else "Approach A (Powers-Brownyard)",
-            "wb_ratio": wb_ratio, "fresh_density": fresh_density,
-            "binder_desc": binder_desc_str, "rho_cement": rho_cement
-        }
-        pdf_strength = {"strength": final_fcu_28, "ci_low": ci_low, "ci_high": ci_high, "air_penalty": (1.0 - air_penalty_factor) * 100.0, "air_pct": v_void}
-        pdf_slump = {"slump": est_slump_clamped, "class": slump_class}
-        pdf_mass_pcts = {"Binder": c_wt_pct, "Water": w_wt_pct, "Fine Agg": fine_wt_pct, "Coarse Agg": coarse_wt_pct}
+        c_mix_save, c_mix_pdf = st.columns(2)
 
-        try:
-            pdf_bytes = generate_mix_design_pdf(pdf_meta, df_mix_res, pdf_strength, pdf_slump, pdf_mass_pcts)
-            st.download_button(
-                label="📥 Download Concrete Mix Design Report (PDF)",
-                data=pdf_bytes,
-                file_name=f"{cur_job_num}_{mix_sample_label}_mix_report.pdf",
-                mime="application/pdf",
-                type="primary"
-            )
-        except Exception as e:
-            st.error(f"Error generating PDF report: {e}")
+        with c_mix_save:
+            if st.button("💾 Save Reconstructed Mix Scenario to Database", type="primary"):
+                mix_db_payload = {
+                    "sample_id": mix_sample_label,
+                    "calculation_approach": "Approach B: Mass Balance" if is_approach_b else "Approach A: Powers-Brownyard",
+                    "estimated_wb_ratio": wb_ratio,
+                    "main_binder_type": main_binder,
+                    "pct_main_binder": pct_main,
+                    "pct_ggbs": pct_ggbs,
+                    "pct_pfa": pct_pfa,
+                    "pct_microsilica": pct_sf,
+                    "pct_metakaolin": pct_mk,
+                    "effective_binder_density": rho_cement,
+                    "fresh_density_kgm3": fresh_density,
+                    "total_agg_to_binder_ratio": total_agg_ratio,
+                    "cement_grade_selected": cement_grade,
+                    "coarse_texture_selected": coarse_type,
+                    "estimated_cube_strength_mpa": final_fcu_28,
+                    "strength_ci_low_mpa": ci_low,
+                    "strength_ci_high_mpa": ci_high,
+                    "air_penalty_applied_pct": (1.0 - air_penalty_factor) * 100.0,
+                    "admixture_scenario": admixture_scenario,
+                    "estimated_slump_mm": est_slump_clamped,
+                    "slump_class": slump_class
+                }
+                saved_ver = save_concrete_mix_design_to_db(mix_db_payload, df_mix_res)
+                st.success(f"Mix Design Scenario v{saved_ver} successfully committed to database!")
+
+        # PDF Export
+        with c_mix_pdf:
+            pdf_meta = {
+                "sample_id": mix_sample_label, "job_number": cur_job_num, "sample_order": cur_sample_ord,
+                "operator": cur_op_name, "approach": "Approach B (Mass Balance)" if is_approach_b else "Approach A (Powers-Brownyard)",
+                "wb_ratio": wb_ratio, "fresh_density": fresh_density,
+                "binder_desc": binder_desc_str, "rho_cement": rho_cement
+            }
+            pdf_strength = {"strength": final_fcu_28, "ci_low": ci_low, "ci_high": ci_high, "air_penalty": (1.0 - air_penalty_factor) * 100.0, "air_pct": v_void}
+            pdf_slump = {"slump": est_slump_clamped, "class": slump_class}
+            pdf_mass_pcts = {"Binder": c_wt_pct, "Water": w_wt_pct, "Fine Agg": fine_wt_pct, "Coarse Agg": coarse_wt_pct}
+
+            try:
+                pdf_bytes = generate_mix_design_pdf(pdf_meta, df_mix_res, pdf_strength, pdf_slump, pdf_mass_pcts)
+                st.download_button(
+                    label="📥 Download Concrete Mix Design Report (PDF)",
+                    data=pdf_bytes,
+                    file_name=f"{cur_job_num}_{mix_sample_label}_mix_report.pdf",
+                    mime="application/pdf"
+                )
+            except Exception as e:
+                st.error(f"Error generating PDF report: {e}")
 
 # =========================================================
 # TAB 4: MULTI-SAMPLE COMPARISON PLACEHOLDER
@@ -1515,21 +1808,60 @@ with main_tab5:
     st.button("🔗 Connect to Google Workspace Drive")
 
 # =========================================================
-# TAB 6: LOCAL DATABASE BROWSER
+# TAB 6: LOCAL DATABASE BROWSER (MULTI-ENTITY INSPECTOR)
 # =========================================================
 with main_tab6:
-    st.subheader("📁 Saved Geological Samples History")
+    st.subheader("📁 Saved Geological Database Records Inspector")
+    
+    db_view_tab1, db_view_tab2, db_view_tab3 = st.tabs([
+        "Master Samples & Modal History", 
+        "Petro QC & Spatial Metrics", 
+        "Saved Concrete Mix Scenarios"
+    ])
+    
     df_history = load_all_samples()
     
-    if not df_history.empty:
-        st.dataframe(df_history, width="stretch")
-        selected_sample = st.selectbox("Select Sample to View Modal Breakdown", df_history["sample_id"].unique(), key="hist_db_sel")
-        if selected_sample:
-            df_modal_history = load_sample_details(selected_sample)
-            st.write(f"##### Modal Breakdown for: **{selected_sample}**")
-            st.dataframe(df_modal_history, width="stretch")
-    else:
-        st.info("No saved samples found in the local database yet.")
+    with db_view_tab1:
+        if not df_history.empty:
+            st.dataframe(df_history, width="stretch")
+            selected_sample = st.selectbox("Select Sample to View Modal Breakdown", df_history["sample_id"].unique(), key="hist_db_sel")
+            if selected_sample:
+                df_modal_history = load_sample_details(selected_sample)
+                st.write(f"##### Modal Breakdown for: **{selected_sample}**")
+                st.dataframe(df_modal_history, width="stretch")
+        else:
+            st.info("No saved samples found in the database yet.")
+
+    with db_view_tab2:
+        if not df_history.empty:
+            conn = sqlite3.connect(DB_FILE)
+            df_qc_all = pd.read_sql_query("SELECT * FROM petro_qc_metrics ORDER BY calculated_at DESC", conn)
+            conn.close()
+            if not df_qc_all.empty:
+                st.dataframe(df_qc_all, width="stretch")
+            else:
+                st.info("No petrographic QC metrics saved yet. Commit samples from Tab 1 to populate.")
+        else:
+            st.info("No saved samples available.")
+
+    with db_view_tab3:
+        if not df_history.empty:
+            conn = sqlite3.connect(DB_FILE)
+            df_mix_all = pd.read_sql_query("SELECT * FROM concrete_mix_designs ORDER BY committed_at DESC", conn)
+            conn.close()
+            if not df_mix_all.empty:
+                st.dataframe(df_mix_all, width="stretch")
+                sel_mix_id = st.selectbox("Select Mix Scenario ID to inspect constituent breakdown:", df_mix_all["mix_id"].unique())
+                if sel_mix_id:
+                    conn = sqlite3.connect(DB_FILE)
+                    df_bdown = pd.read_sql_query("SELECT * FROM mix_design_breakdown WHERE mix_id = ?", conn, params=(int(sel_mix_id),))
+                    conn.close()
+                    st.write(f"##### Batch Breakdown for Scenario Mix ID #{sel_mix_id}")
+                    st.dataframe(df_bdown, width="stretch")
+            else:
+                st.info("No concrete mix design scenarios committed yet. Save scenarios from Tab 3 to populate.")
+        else:
+            st.info("No saved samples available.")
 
 # =========================================================
 # TAB 7: APPLICATION GUIDE, DB SCHEMA & DEVELOPER INFO
@@ -1559,11 +1891,11 @@ with main_tab7:
           *Cloud repository integration.* Connects to shared Google Drive folders for rapid reference to standard optical atlases and testing protocols.
           
         * **Tab 6: 📁 Local Database Browser**  
-          *Master database record inspection.* Browse parent `samples` and child `modal_results` records, verify integrity, and inspect historical timestamps.
+          *Master database record inspection.* Browse parent `samples`, child `modal_results`, `petro_qc_metrics`, and versioned `concrete_mix_designs` scenarios.
         """)
         
     st.markdown("---")
-    st.markdown("### 🗄️ Relational Database Schema Architecture")
+    st.markdown("### 🗄️ Relational Database Schema Architecture (5-Table Modular Structure)")
     st.code("""
   +---------------------------------------------------------------------------------+
   |                                  SAMPLES (Master)                               |
@@ -1577,28 +1909,54 @@ with main_tab7:
   | valid_points           : INTEGER      -> Points excluding "NA"                  |
   | bounding_area_mm2      : REAL         -> Calculated thin section area (mm²)     |
   | linear_traverse_mm     : REAL         -> Total traverse length (mm)             |
+  | traverses_y_count      : INTEGER      -> Number of horizontal traverse lines    |
+  | transects_x_count      : INTEGER      -> Number of vertical transects           |
+  | traverse_spacing_um    : REAL         -> Mean point spacing pitch (um)          |
   | lithology_code         : VARCHAR(50)  -> 3-letter I.S. 465 code (e.g., MCM)     |
-  | created_at             : TIMESTAMP    -> Date & time of commitment              |
+  | created_at             : TIMESTAMP    -> Date & time of initial commitment      |
+  | updated_at             : TIMESTAMP    -> Date & time of last modification       |
   +---------------------------------------------------------------------------------+
-                                           |
-                                           | 1 : N (One-to-Many Relationship)
-                                           v
-  +---------------------------------------------------------------------------------+
-  |                               MODAL_RESULTS (Child)                             |
-  +---------------------------------------------------------------------------------+
-  | id (PK)                : INTEGER AUTOINCREMENT / SERIAL                         |
-  | sample_id (FK)         : VARCHAR(100) -> Foreign Key references SAMPLES        |
-  | phase_name             : VARCHAR(100) -> Standardized mineral/phase name        |
-  | point_count            : INTEGER      -> Raw points attributed to this phase    |
-  | modal_percent          : REAL         -> Stereological volume percentage (vol%) |
-  | std_error              : REAL         -> 2-Sigma confidence interval (±%)       |
-  | abundance              : VARCHAR(50)  -> Major, Minor, or Trace classification  |
-  | density_gcm3           : REAL         -> Assigned specific density (g/cm³)      |
-  | wt_percent             : REAL         -> Recalculated mass percentage (wt%)     |
-  | en933_class            : VARCHAR(100) -> Recycled aggregate class (Rc, Ru, etc)|
-  | carbonation            : VARCHAR(50)  -> Carbonation state                      |
-  | liberation             : VARCHAR(50)  -> Particle liberation index              |
-  +---------------------------------------------------------------------------------+
+           |                                  |                               |
+           | 1:N                              | 1:1                           | 1:N (Versioned)
+           v                                  v                               v
+  +----------------------+  +-----------------------------+  +------------------------------------+
+  |     MODAL_RESULTS    |  |       PETRO_QC_METRICS      |  |        CONCRETE_MIX_DESIGNS        |
+  +----------------------+  +-----------------------------+  +------------------------------------+
+  | id (PK)              |  | id (PK)                     |  | mix_id (PK)                        |
+  | sample_id (FK)       |  | sample_id (FK, UNIQUE)      |  | sample_id (FK)                     |
+  | phase_name           |  | clark_evans_r               |  | version_number                     |
+  | point_count          |  | dispersion_pattern          |  | calculation_approach               |
+  | modal_percent        |  | asr_risk_rating             |  | estimated_wb_ratio                 |
+  | std_error            |  | asr_risk_description        |  | main_binder_type                   |
+  | abundance            |  | is465_total_agg_pct         |  | pct_main_binder                    |
+  | density_gcm3         |  | is465_good_agg_pct          |  | pct_ggbs / pct_pfa / pct_sf / mk   |
+  | wt_percent           |  | is465_bad_agg_pct           |  | effective_binder_density           |
+  | functional_role      |  | qapf_norm_q / norm_a / p    |  | fresh_density_kgm3                 |
+  | en933_class          |  | calculated_at               |  | total_agg_to_binder_ratio          |
+  | carbonation          |  +-----------------------------+  | cement_grade_selected              |
+  | liberation           |                                   | estimated_cube_strength_mpa        |
+  +----------------------+                                   | strength_ci_low / high_mpa         |
+                                                             | air_penalty_applied_pct            |
+                                                             | admixture_scenario                 |
+                                                             | estimated_slump_mm / slump_class   |
+                                                             | committed_at                       |
+                                                             +------------------------------------+
+                                                                                |
+                                                                                | 1:N (Constituents)
+                                                                                v
+                                                             +------------------------------------+
+                                                             |        MIX_DESIGN_BREAKDOWN        |
+                                                             +------------------------------------+
+                                                             | id (PK)                            |
+                                                             | mix_id (FK)                        |
+                                                             | sample_id                          |
+                                                             | constituent                        |
+                                                             | batch_weight_kgm3                  |
+                                                             | batch_volume_lm3                   |
+                                                             | mass_percent (wt%)                 |
+                                                             | volume_percent (vol%)              |
+                                                             | mix_proportion_ratio (1:X)         |
+                                                             +------------------------------------+
     """, language="text")
 
     st.markdown("---")
