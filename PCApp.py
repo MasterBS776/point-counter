@@ -1,5 +1,6 @@
 import sqlite3
 import io
+import os
 import struct
 import datetime
 import pandas as pd
@@ -8,6 +9,8 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 from scipy.spatial.distance import cdist
+
+from sqlalchemy import create_engine, text
 
 # ReportLab imports for direct in-memory PDF generation
 from reportlab.lib.pagesizes import A4
@@ -83,13 +86,52 @@ st.markdown("""
 st.title("🔬 Geological Petrography Analysis Platform")
 
 SCALE_UM_PER_PX = 1.82  # 1.82 microns per pixel
-DB_FILE = "petrography_data.db"
+DEFAULT_LOCAL_DB = "petrography_data.db"
 
 # ---------------------------------------------------------
-# 0. DATABASE PERSISTENCE & AUTO-MIGRATION MODULE (5 TABLES)
+# DATABASE ENGINE ROUTER (TIER 1, TIER 2, TIER 3)
 # ---------------------------------------------------------
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
+if "db_engine_mode" not in st.session_state:
+    st.session_state["db_engine_mode"] = "Shared Local DB"
+
+if "personal_db_path" not in st.session_state:
+    st.session_state["personal_db_path"] = DEFAULT_LOCAL_DB
+
+if "supabase_conn_str" not in st.session_state:
+    st.session_state["supabase_conn_str"] = ""
+
+def get_db_info():
+    mode = st.session_state.get("db_engine_mode", "Shared Local DB")
+    if mode == "Personal DB":
+        filename = os.path.basename(st.session_state["personal_db_path"])
+        return f"Personal DB ({filename})"
+    elif mode == "Supabase (PostgreSQL)":
+        return "Supabase Network (PostgreSQL)"
+    else:
+        return "Shared Local DB (SQLite)"
+
+def get_sqlite_target_path():
+    mode = st.session_state.get("db_engine_mode", "Shared Local DB")
+    if mode == "Personal DB":
+        return st.session_state.get("personal_db_path", DEFAULT_LOCAL_DB)
+    return DEFAULT_LOCAL_DB
+
+def get_connection():
+    mode = st.session_state.get("db_engine_mode", "Shared Local DB")
+    if mode == "Supabase (PostgreSQL)":
+        conn_str = st.session_state.get("supabase_conn_str", "")
+        if not conn_str:
+            raise ValueError("Supabase connection string is empty. Configure it in Tab 6.")
+        return create_engine(conn_str)
+    else:
+        return sqlite3.connect(get_sqlite_target_path())
+
+# ---------------------------------------------------------
+# 0. DATABASE SCHEMA INITIALIZATION & AUTO-MIGRATION
+# ---------------------------------------------------------
+def init_db(target_sqlite_file=None):
+    db_file = target_sqlite_file or get_sqlite_target_path()
+    conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
     
     # 1. Base Master Samples Table
@@ -113,7 +155,6 @@ def init_db():
         )
     """)
     
-    # Migrations for existing samples tables
     for col, c_type in [
         ("lithology_code", "TEXT"),
         ("traverses_y_count", "INTEGER"),
@@ -231,7 +272,6 @@ def init_db():
 init_db()
 
 def _clean_numeric_val(val, to_float=False):
-    """Safely converts potential byte-blobs or malformed values from SQLite to clean numbers."""
     if pd.isna(val) or val is None:
         return 0.0 if to_float else 0
     if isinstance(val, (bytes, bytearray)):
@@ -249,200 +289,309 @@ def _clean_numeric_val(val, to_float=False):
     except (ValueError, TypeError):
         return 0.0 if to_float else 0
 
+# ---------------------------------------------------------
+# DATABASE CRUD OPERATIONS (DISPATCHED THROUGH ROUTER)
+# ---------------------------------------------------------
 def save_sample_to_db(sample_meta, df_summary, qc_metrics=None):
-    """Saves master sample, child modal results, and petro QC metrics atomically."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    mode = st.session_state.get("db_engine_mode", "Shared Local DB")
     
-    # 1. Upsert Parent Record
-    cursor.execute("""
-        INSERT INTO samples 
-        (sample_id, job_number, sample_order, sample_type, operator, total_points, valid_points, 
-         bounding_area_mm2, linear_traverse_mm, traverses_y_count, transects_x_count, 
-         traverse_spacing_um, lithology_code, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(sample_id) DO UPDATE SET
-            job_number = excluded.job_number,
-            sample_order = excluded.sample_order,
-            sample_type = excluded.sample_type,
-            operator = excluded.operator,
-            total_points = excluded.total_points,
-            valid_points = excluded.valid_points,
-            bounding_area_mm2 = excluded.bounding_area_mm2,
-            linear_traverse_mm = excluded.linear_traverse_mm,
-            traverses_y_count = excluded.traverses_y_count,
-            transects_x_count = excluded.transects_x_count,
-            traverse_spacing_um = excluded.traverse_spacing_um,
-            lithology_code = excluded.lithology_code,
-            updated_at = CURRENT_TIMESTAMP
-    """, (
-        str(sample_meta["sample_id"]),
-        str(sample_meta["job_number"]),
-        str(sample_meta["sample_order"]),
-        str(sample_meta["sample_type"]),
-        str(sample_meta["operator"]),
-        int(_clean_numeric_val(sample_meta.get("total_points", 0), to_float=False)),
-        int(_clean_numeric_val(sample_meta.get("valid_points", 0), to_float=False)),
-        float(_clean_numeric_val(sample_meta.get("area_mm2", 0.0), to_float=True)),
-        float(_clean_numeric_val(sample_meta.get("linear_traverse_mm", 0.0), to_float=True)),
-        int(_clean_numeric_val(sample_meta.get("traverses_y_count", 0), to_float=False)),
-        int(_clean_numeric_val(sample_meta.get("transects_x_count", 0), to_float=False)),
-        float(_clean_numeric_val(sample_meta.get("traverse_spacing_um", 0.0), to_float=True)),
-        str(sample_meta.get("lithology_code", ""))
-    ))
-    
-    # 2. Re-populate Modal Results
-    cursor.execute("DELETE FROM modal_results WHERE sample_id = ?", (str(sample_meta["sample_id"]),))
-    
-    for _, row in df_summary.iterrows():
-        p_name = str(row.get("Standardized_Phase", row.get("phase_name", "")))
-        p_count = int(_clean_numeric_val(row.get("Point_Count", row.get("point_count", 0)), to_float=False))
-        m_pct = float(_clean_numeric_val(row.get("Modal_Percent (%)", row.get("modal_percent", 0.0)), to_float=True))
-        s_err = float(_clean_numeric_val(row.get("Std_Error (%)", row.get("std_error", 0.0)), to_float=True))
-        abun = row.get("Abundance", row.get("abundance", None))
-        
-        raw_dens = row.get("Density (g/cm³)", row.get("density_gcm3", None))
-        d_val = float(_clean_numeric_val(raw_dens, to_float=True)) if pd.notnull(raw_dens) else None
-        
-        raw_wt = row.get("Weight_Percent (%)", row.get("wt_percent", None))
-        wt_val = float(_clean_numeric_val(raw_wt, to_float=True)) if pd.notnull(raw_wt) else None
+    if mode == "Supabase (PostgreSQL)":
+        engine = get_connection()
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO samples 
+                (sample_id, job_number, sample_order, sample_type, operator, total_points, valid_points, 
+                 bounding_area_mm2, linear_traverse_mm, traverses_y_count, transects_x_count, 
+                 traverse_spacing_um, lithology_code, updated_at)
+                VALUES (:sid, :job, :s_ord, :stype, :op, :tp, :vp, :area, :trav, :ty, :tx, :pitch, :lith, CURRENT_TIMESTAMP)
+                ON CONFLICT(sample_id) DO UPDATE SET
+                    job_number = EXCLUDED.job_number,
+                    sample_order = EXCLUDED.sample_order,
+                    sample_type = EXCLUDED.sample_type,
+                    operator = EXCLUDED.operator,
+                    total_points = EXCLUDED.total_points,
+                    valid_points = EXCLUDED.valid_points,
+                    bounding_area_mm2 = EXCLUDED.bounding_area_mm2,
+                    linear_traverse_mm = EXCLUDED.linear_traverse_mm,
+                    traverses_y_count = EXCLUDED.traverses_y_count,
+                    transects_x_count = EXCLUDED.transects_x_count,
+                    traverse_spacing_um = EXCLUDED.traverse_spacing_um,
+                    lithology_code = EXCLUDED.lithology_code,
+                    updated_at = CURRENT_TIMESTAMP
+            """), {
+                "sid": str(sample_meta["sample_id"]),
+                "job": str(sample_meta["job_number"]),
+                "s_ord": str(sample_meta["sample_order"]),
+                "stype": str(sample_meta["sample_type"]),
+                "op": str(sample_meta["operator"]),
+                "tp": int(_clean_numeric_val(sample_meta.get("total_points", 0))),
+                "vp": int(_clean_numeric_val(sample_meta.get("valid_points", 0))),
+                "area": float(_clean_numeric_val(sample_meta.get("area_mm2", 0.0), to_float=True)),
+                "trav": float(_clean_numeric_val(sample_meta.get("linear_traverse_mm", 0.0), to_float=True)),
+                "ty": int(_clean_numeric_val(sample_meta.get("traverses_y_count", 0))),
+                "tx": int(_clean_numeric_val(sample_meta.get("transects_x_count", 0))),
+                "pitch": float(_clean_numeric_val(sample_meta.get("traverse_spacing_um", 0.0), to_float=True)),
+                "lith": str(sample_meta.get("lithology_code", ""))
+            })
+            
+            conn.execute(text("DELETE FROM modal_results WHERE sample_id = :sid"), {"sid": str(sample_meta["sample_id"])})
+            
+            for _, row in df_summary.iterrows():
+                p_name = str(row.get("Standardized_Phase", row.get("phase_name", "")))
+                p_count = int(_clean_numeric_val(row.get("Point_Count", row.get("point_count", 0))))
+                m_pct = float(_clean_numeric_val(row.get("Modal_Percent (%)", row.get("modal_percent", 0.0)), to_float=True))
+                s_err = float(_clean_numeric_val(row.get("Std_Error (%)", row.get("std_error", 0.0)), to_float=True))
+                abun = row.get("Abundance", row.get("abundance", None))
+                raw_dens = row.get("Density (g/cm³)", row.get("density_gcm3", None))
+                d_val = float(_clean_numeric_val(raw_dens, to_float=True)) if pd.notnull(raw_dens) else None
+                raw_wt = row.get("Weight_Percent (%)", row.get("wt_percent", None))
+                wt_val = float(_clean_numeric_val(raw_wt, to_float=True)) if pd.notnull(raw_wt) else None
 
+                conn.execute(text("""
+                    INSERT INTO modal_results 
+                    (sample_id, phase_name, point_count, modal_percent, std_error, abundance, density_gcm3, wt_percent, functional_role, en933_class, carbonation, liberation)
+                    VALUES (:sid, :p_name, :cnt, :mpct, :serr, :abun, :dens, :wt, :role, :en, :carb, :lib)
+                """), {
+                    "sid": str(sample_meta["sample_id"]), "p_name": p_name, "cnt": p_count, "mpct": m_pct, "serr": s_err,
+                    "abun": str(abun) if abun is not None else None, "dens": d_val, "wt": wt_val,
+                    "role": str(row.get("Role", row.get("functional_role", ""))) or None,
+                    "en": str(row.get("EN933_Class", row.get("en933_class", ""))) or None,
+                    "carb": str(row.get("Carbonation", row.get("carbonation", ""))) or None,
+                    "lib": str(row.get("Liberation", row.get("liberation", ""))) or None
+                })
+                
+            if qc_metrics:
+                conn.execute(text("""
+                    INSERT INTO petro_qc_metrics 
+                    (sample_id, clark_evans_r, dispersion_pattern, asr_risk_rating, asr_risk_description,
+                     is465_total_agg_pct, is465_good_agg_pct, is465_bad_agg_pct, qapf_norm_q, qapf_norm_a, qapf_norm_p, calculated_at)
+                    VALUES (:sid, :r, :patt, :asr, :asrtxt, :tot_agg, :good_agg, :bad_agg, :q, :a, :p, CURRENT_TIMESTAMP)
+                    ON CONFLICT(sample_id) DO UPDATE SET
+                        clark_evans_r = EXCLUDED.clark_evans_r,
+                        dispersion_pattern = EXCLUDED.dispersion_pattern,
+                        asr_risk_rating = EXCLUDED.asr_risk_rating,
+                        asr_risk_description = EXCLUDED.asr_risk_description,
+                        is465_total_agg_pct = EXCLUDED.is465_total_agg_pct,
+                        is465_good_agg_pct = EXCLUDED.is465_good_agg_pct,
+                        is465_bad_agg_pct = EXCLUDED.is465_bad_agg_pct,
+                        qapf_norm_q = EXCLUDED.qapf_norm_q,
+                        qapf_norm_a = EXCLUDED.qapf_norm_a,
+                        qapf_norm_p = EXCLUDED.qapf_norm_p,
+                        calculated_at = CURRENT_TIMESTAMP
+                """), {
+                    "sid": str(sample_meta["sample_id"]),
+                    "r": qc_metrics.get("clark_evans_r"), "patt": qc_metrics.get("dispersion_pattern"),
+                    "asr": qc_metrics.get("asr_risk_rating"), "asrtxt": qc_metrics.get("asr_risk_description"),
+                    "tot_agg": qc_metrics.get("is465_total_agg_pct"), "good_agg": qc_metrics.get("is465_good_agg_pct"),
+                    "bad_agg": qc_metrics.get("is465_bad_agg_pct"), "q": qc_metrics.get("qapf_norm_q"),
+                    "a": qc_metrics.get("qapf_norm_a"), "p": qc_metrics.get("qapf_norm_p")
+                })
+    else:
+        conn = get_connection()
+        cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO modal_results 
-            (sample_id, phase_name, point_count, modal_percent, std_error, abundance, density_gcm3, wt_percent, functional_role, en933_class, carbonation, liberation)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            str(sample_meta["sample_id"]),
-            p_name,
-            p_count,
-            m_pct,
-            s_err,
-            str(abun) if abun is not None else None,
-            d_val,
-            wt_val,
-            str(row.get("Role", row.get("functional_role", ""))) or None,
-            str(row.get("EN933_Class", row.get("en933_class", ""))) or None,
-            str(row.get("Carbonation", row.get("carbonation", ""))) or None,
-            str(row.get("Liberation", row.get("liberation", ""))) or None
-        ))
-
-    # 3. Upsert Petro QC & Spatial Metrics (1:1)
-    if qc_metrics:
-        cursor.execute("""
-            INSERT INTO petro_qc_metrics 
-            (sample_id, clark_evans_r, dispersion_pattern, asr_risk_rating, asr_risk_description,
-             is465_total_agg_pct, is465_good_agg_pct, is465_bad_agg_pct, qapf_norm_q, qapf_norm_a, qapf_norm_p, calculated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO samples 
+            (sample_id, job_number, sample_order, sample_type, operator, total_points, valid_points, 
+             bounding_area_mm2, linear_traverse_mm, traverses_y_count, transects_x_count, 
+             traverse_spacing_um, lithology_code, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(sample_id) DO UPDATE SET
-                clark_evans_r = excluded.clark_evans_r,
-                dispersion_pattern = excluded.dispersion_pattern,
-                asr_risk_rating = excluded.asr_risk_rating,
-                asr_risk_description = excluded.asr_risk_description,
-                is465_total_agg_pct = excluded.is465_total_agg_pct,
-                is465_good_agg_pct = excluded.is465_good_agg_pct,
-                is465_bad_agg_pct = excluded.is465_bad_agg_pct,
-                qapf_norm_q = excluded.qapf_norm_q,
-                qapf_norm_a = excluded.qapf_norm_a,
-                qapf_norm_p = excluded.qapf_norm_p,
-                calculated_at = CURRENT_TIMESTAMP
+                job_number = excluded.job_number,
+                sample_order = excluded.sample_order,
+                sample_type = excluded.sample_type,
+                operator = excluded.operator,
+                total_points = excluded.total_points,
+                valid_points = excluded.valid_points,
+                bounding_area_mm2 = excluded.bounding_area_mm2,
+                linear_traverse_mm = excluded.linear_traverse_mm,
+                traverses_y_count = excluded.traverses_y_count,
+                transects_x_count = excluded.transects_x_count,
+                traverse_spacing_um = excluded.traverse_spacing_um,
+                lithology_code = excluded.lithology_code,
+                updated_at = CURRENT_TIMESTAMP
         """, (
-            str(sample_meta["sample_id"]),
-            qc_metrics.get("clark_evans_r"),
-            qc_metrics.get("dispersion_pattern"),
-            qc_metrics.get("asr_risk_rating"),
-            qc_metrics.get("asr_risk_description"),
-            qc_metrics.get("is465_total_agg_pct"),
-            qc_metrics.get("is465_good_agg_pct"),
-            qc_metrics.get("is465_bad_agg_pct"),
-            qc_metrics.get("qapf_norm_q"),
-            qc_metrics.get("qapf_norm_a"),
-            qc_metrics.get("qapf_norm_p")
+            str(sample_meta["sample_id"]), str(sample_meta["job_number"]), str(sample_meta["sample_order"]),
+            str(sample_meta["sample_type"]), str(sample_meta["operator"]),
+            int(_clean_numeric_val(sample_meta.get("total_points", 0))),
+            int(_clean_numeric_val(sample_meta.get("valid_points", 0))),
+            float(_clean_numeric_val(sample_meta.get("area_mm2", 0.0), to_float=True)),
+            float(_clean_numeric_val(sample_meta.get("linear_traverse_mm", 0.0), to_float=True)),
+            int(_clean_numeric_val(sample_meta.get("traverses_y_count", 0))),
+            int(_clean_numeric_val(sample_meta.get("transects_x_count", 0))),
+            float(_clean_numeric_val(sample_meta.get("traverse_spacing_um", 0.0), to_float=True)),
+            str(sample_meta.get("lithology_code", ""))
         ))
         
-    conn.commit()
-    conn.close()
+        cursor.execute("DELETE FROM modal_results WHERE sample_id = ?", (str(sample_meta["sample_id"]),))
+        for _, row in df_summary.iterrows():
+            p_name = str(row.get("Standardized_Phase", row.get("phase_name", "")))
+            p_count = int(_clean_numeric_val(row.get("Point_Count", row.get("point_count", 0))))
+            m_pct = float(_clean_numeric_val(row.get("Modal_Percent (%)", row.get("modal_percent", 0.0)), to_float=True))
+            s_err = float(_clean_numeric_val(row.get("Std_Error (%)", row.get("std_error", 0.0)), to_float=True))
+            abun = row.get("Abundance", row.get("abundance", None))
+            raw_dens = row.get("Density (g/cm³)", row.get("density_gcm3", None))
+            d_val = float(_clean_numeric_val(raw_dens, to_float=True)) if pd.notnull(raw_dens) else None
+            raw_wt = row.get("Weight_Percent (%)", row.get("wt_percent", None))
+            wt_val = float(_clean_numeric_val(raw_wt, to_float=True)) if pd.notnull(raw_wt) else None
+
+            cursor.execute("""
+                INSERT INTO modal_results 
+                (sample_id, phase_name, point_count, modal_percent, std_error, abundance, density_gcm3, wt_percent, functional_role, en933_class, carbonation, liberation)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                str(sample_meta["sample_id"]), p_name, p_count, m_pct, s_err,
+                str(abun) if abun is not None else None, d_val, wt_val,
+                str(row.get("Role", row.get("functional_role", ""))) or None,
+                str(row.get("EN933_Class", row.get("en933_class", ""))) or None,
+                str(row.get("Carbonation", row.get("carbonation", ""))) or None,
+                str(row.get("Liberation", row.get("liberation", ""))) or None
+            ))
+
+        if qc_metrics:
+            cursor.execute("""
+                INSERT INTO petro_qc_metrics 
+                (sample_id, clark_evans_r, dispersion_pattern, asr_risk_rating, asr_risk_description,
+                 is465_total_agg_pct, is465_good_agg_pct, is465_bad_agg_pct, qapf_norm_q, qapf_norm_a, qapf_norm_p, calculated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(sample_id) DO UPDATE SET
+                    clark_evans_r = excluded.clark_evans_r,
+                    dispersion_pattern = excluded.dispersion_pattern,
+                    asr_risk_rating = excluded.asr_risk_rating,
+                    asr_risk_description = excluded.asr_risk_description,
+                    is465_total_agg_pct = excluded.is465_total_agg_pct,
+                    is465_good_agg_pct = excluded.is465_good_agg_pct,
+                    is465_bad_agg_pct = excluded.is465_bad_agg_pct,
+                    qapf_norm_q = excluded.qapf_norm_q,
+                    qapf_norm_a = excluded.qapf_norm_a,
+                    qapf_norm_p = excluded.qapf_norm_p,
+                    calculated_at = CURRENT_TIMESTAMP
+            """, (
+                str(sample_meta["sample_id"]), qc_metrics.get("clark_evans_r"), qc_metrics.get("dispersion_pattern"),
+                qc_metrics.get("asr_risk_rating"), qc_metrics.get("asr_risk_description"),
+                qc_metrics.get("is465_total_agg_pct"), qc_metrics.get("is465_good_agg_pct"),
+                qc_metrics.get("is465_bad_agg_pct"), qc_metrics.get("qapf_norm_q"),
+                qc_metrics.get("qapf_norm_a"), qc_metrics.get("qapf_norm_p")
+            ))
+            
+        conn.commit()
+        conn.close()
 
 def save_concrete_mix_design_to_db(mix_payload, df_breakdown):
-    """Saves a versioned concrete mix design scenario and its batch constituents."""
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    mode = st.session_state.get("db_engine_mode", "Shared Local DB")
     sample_id = str(mix_payload["sample_id"])
     
-    # Calculate next version number for this sample
-    cursor.execute("SELECT COALESCE(MAX(version_number), 0) + 1 FROM concrete_mix_designs WHERE sample_id = ?", (sample_id,))
-    next_ver = cursor.fetchone()[0]
-    
-    cursor.execute("""
-        INSERT INTO concrete_mix_designs 
-        (sample_id, version_number, calculation_approach, estimated_wb_ratio, main_binder_type,
-         pct_main_binder, pct_ggbs, pct_pfa, pct_microsilica, pct_metakaolin,
-         effective_binder_density, fresh_density_kgm3, total_agg_to_binder_ratio,
-         cement_grade_selected, coarse_texture_selected, estimated_cube_strength_mpa,
-         strength_ci_low_mpa, strength_ci_high_mpa, air_penalty_applied_pct,
-         admixture_scenario, estimated_slump_mm, slump_class, committed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    """, (
-        sample_id,
-        next_ver,
-        mix_payload["calculation_approach"],
-        float(mix_payload["estimated_wb_ratio"]),
-        mix_payload["main_binder_type"],
-        float(mix_payload["pct_main_binder"]),
-        float(mix_payload.get("pct_ggbs", 0.0)),
-        float(mix_payload.get("pct_pfa", 0.0)),
-        float(mix_payload.get("pct_microsilica", 0.0)),
-        float(mix_payload.get("pct_metakaolin", 0.0)),
-        float(mix_payload["effective_binder_density"]),
-        float(mix_payload["fresh_density_kgm3"]),
-        float(mix_payload["total_agg_to_binder_ratio"]),
-        mix_payload.get("cement_grade_selected", ""),
-        mix_payload.get("coarse_texture_selected", ""),
-        float(mix_payload.get("estimated_cube_strength_mpa", 0.0)),
-        float(mix_payload.get("strength_ci_low_mpa", 0.0)),
-        float(mix_payload.get("strength_ci_high_mpa", 0.0)),
-        float(mix_payload.get("air_penalty_applied_pct", 0.0)),
-        mix_payload.get("admixture_scenario", ""),
-        float(mix_payload.get("estimated_slump_mm", 0.0)),
-        mix_payload.get("slump_class", "")
-    ))
-    
-    mix_id = cursor.lastrowid
-    
-    # Insert constituent lines into mix_design_breakdown
-    for _, row in df_breakdown.iterrows():
+    if mode == "Supabase (PostgreSQL)":
+        engine = get_connection()
+        with engine.begin() as conn:
+            res = conn.execute(text("SELECT COALESCE(MAX(version_number), 0) + 1 FROM concrete_mix_designs WHERE sample_id = :sid"), {"sid": sample_id})
+            next_ver = res.scalar()
+            
+            res_ins = conn.execute(text("""
+                INSERT INTO concrete_mix_designs 
+                (sample_id, version_number, calculation_approach, estimated_wb_ratio, main_binder_type,
+                 pct_main_binder, pct_ggbs, pct_pfa, pct_microsilica, pct_metakaolin,
+                 effective_binder_density, fresh_density_kgm3, total_agg_to_binder_ratio,
+                 cement_grade_selected, coarse_texture_selected, estimated_cube_strength_mpa,
+                 strength_ci_low_mpa, strength_ci_high_mpa, air_penalty_applied_pct,
+                 admixture_scenario, estimated_slump_mm, slump_class, committed_at)
+                VALUES (:sid, :ver, :appr, :wb, :mb, :pmb, :ggbs, :pfa, :sf, :mk, :eff_d, :fd, :agg_b, :cg, :ct, :str, :ci_l, :ci_h, :air_p, :admix, :slump, :sclass, CURRENT_TIMESTAMP)
+                RETURNING mix_id
+            """), {
+                "sid": sample_id, "ver": next_ver, "appr": mix_payload["calculation_approach"],
+                "wb": float(mix_payload["estimated_wb_ratio"]), "mb": mix_payload["main_binder_type"],
+                "pmb": float(mix_payload["pct_main_binder"]), "ggbs": float(mix_payload.get("pct_ggbs", 0.0)),
+                "pfa": float(mix_payload.get("pct_pfa", 0.0)), "sf": float(mix_payload.get("pct_microsilica", 0.0)),
+                "mk": float(mix_payload.get("pct_metakaolin", 0.0)), "eff_d": float(mix_payload["effective_binder_density"]),
+                "fd": float(mix_payload["fresh_density_kgm3"]), "agg_b": float(mix_payload["total_agg_to_binder_ratio"]),
+                "cg": mix_payload.get("cement_grade_selected", ""), "ct": mix_payload.get("coarse_texture_selected", ""),
+                "str": float(mix_payload.get("estimated_cube_strength_mpa", 0.0)),
+                "ci_l": float(mix_payload.get("strength_ci_low_mpa", 0.0)), "ci_h": float(mix_payload.get("strength_ci_high_mpa", 0.0)),
+                "air_p": float(mix_payload.get("air_penalty_applied_pct", 0.0)), "admix": mix_payload.get("admixture_scenario", ""),
+                "slump": float(mix_payload.get("estimated_slump_mm", 0.0)), "sclass": mix_payload.get("slump_class", "")
+            })
+            mix_id = res_ins.scalar()
+            
+            for _, row in df_breakdown.iterrows():
+                conn.execute(text("""
+                    INSERT INTO mix_design_breakdown 
+                    (mix_id, sample_id, constituent, batch_weight_kgm3, batch_volume_lm3, mass_percent, volume_percent, mix_proportion_ratio)
+                    VALUES (:mid, :sid, :const, :wt, :vol, :mpct, :vpct, :ratio)
+                """), {
+                    "mid": mix_id, "sid": sample_id, "const": str(row["Constituent"]),
+                    "wt": float(_clean_numeric_val(row["Batch Weight (kg/m³)"].replace(" kg/m³", "") if isinstance(row["Batch Weight (kg/m³)"], str) else row["Batch Weight (kg/m³)"], to_float=True)),
+                    "vol": float(_clean_numeric_val(row["Batch Volume (L/m³)"].replace(" L/m³", "") if isinstance(row["Batch Volume (L/m³)"], str) else row["Batch Volume (L/m³)"], to_float=True)),
+                    "mpct": float(_clean_numeric_val(row["Determined Mass % (wt%)"].replace("%", "") if isinstance(row["Determined Mass % (wt%)"], str) else row["Determined Mass % (wt%)"], to_float=True)),
+                    "vpct": float(_clean_numeric_val(row["Determined Vol %"].replace("%", "") if isinstance(row["Determined Vol %"], str) else row["Determined Vol %"], to_float=True)),
+                    "ratio": float(_clean_numeric_val(row["Mix Proportion (1 : X)"].split()[0] if isinstance(row["Mix Proportion (1 : X)"], str) and row["Mix Proportion (1 : X)"][0].isdigit() else 0.0, to_float=True))
+                })
+        return next_ver
+    else:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COALESCE(MAX(version_number), 0) + 1 FROM concrete_mix_designs WHERE sample_id = ?", (sample_id,))
+        next_ver = cursor.fetchone()[0]
+        
         cursor.execute("""
-            INSERT INTO mix_design_breakdown 
-            (mix_id, sample_id, constituent, batch_weight_kgm3, batch_volume_lm3, mass_percent, volume_percent, mix_proportion_ratio)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO concrete_mix_designs 
+            (sample_id, version_number, calculation_approach, estimated_wb_ratio, main_binder_type,
+             pct_main_binder, pct_ggbs, pct_pfa, pct_microsilica, pct_metakaolin,
+             effective_binder_density, fresh_density_kgm3, total_agg_to_binder_ratio,
+             cement_grade_selected, coarse_texture_selected, estimated_cube_strength_mpa,
+             strength_ci_low_mpa, strength_ci_high_mpa, air_penalty_applied_pct,
+             admixture_scenario, estimated_slump_mm, slump_class, committed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """, (
-            mix_id,
-            sample_id,
-            str(row["Constituent"]),
-            float(_clean_numeric_val(row["Batch Weight (kg/m³)"].replace(" kg/m³", "") if isinstance(row["Batch Weight (kg/m³)"], str) else row["Batch Weight (kg/m³)"], to_float=True)),
-            float(_clean_numeric_val(row["Batch Volume (L/m³)"].replace(" L/m³", "") if isinstance(row["Batch Volume (L/m³)"], str) else row["Batch Volume (L/m³)"], to_float=True)),
-            float(_clean_numeric_val(row["Determined Mass % (wt%)"].replace("%", "") if isinstance(row["Determined Mass % (wt%)"], str) else row["Determined Mass % (wt%)"], to_float=True)),
-            float(_clean_numeric_val(row["Determined Vol %"].replace("%", "") if isinstance(row["Determined Vol %"], str) else row["Determined Vol %"], to_float=True)),
-            float(_clean_numeric_val(row["Mix Proportion (1 : X)"].split()[0] if isinstance(row["Mix Proportion (1 : X)"], str) and row["Mix Proportion (1 : X)"][0].isdigit() else 0.0, to_float=True))
+            sample_id, next_ver, mix_payload["calculation_approach"], float(mix_payload["estimated_wb_ratio"]),
+            mix_payload["main_binder_type"], float(mix_payload["pct_main_binder"]),
+            float(mix_payload.get("pct_ggbs", 0.0)), float(mix_payload.get("pct_pfa", 0.0)),
+            float(mix_payload.get("pct_microsilica", 0.0)), float(mix_payload.get("pct_metakaolin", 0.0)),
+            float(mix_payload["effective_binder_density"]), float(mix_payload["fresh_density_kgm3"]),
+            float(mix_payload["total_agg_to_binder_ratio"]), mix_payload.get("cement_grade_selected", ""),
+            mix_payload.get("coarse_texture_selected", ""), float(mix_payload.get("estimated_cube_strength_mpa", 0.0)),
+            float(mix_payload.get("strength_ci_low_mpa", 0.0)), float(mix_payload.get("strength_ci_high_mpa", 0.0)),
+            float(mix_payload.get("air_penalty_applied_pct", 0.0)), mix_payload.get("admixture_scenario", ""),
+            float(mix_payload.get("estimated_slump_mm", 0.0)), mix_payload.get("slump_class", "")
         ))
         
-    conn.commit()
-    conn.close()
-    return next_ver
+        mix_id = cursor.lastrowid
+        for _, row in df_breakdown.iterrows():
+            cursor.execute("""
+                INSERT INTO mix_design_breakdown 
+                (mix_id, sample_id, constituent, batch_weight_kgm3, batch_volume_lm3, mass_percent, volume_percent, mix_proportion_ratio)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                mix_id, sample_id, str(row["Constituent"]),
+                float(_clean_numeric_val(row["Batch Weight (kg/m³)"].replace(" kg/m³", "") if isinstance(row["Batch Weight (kg/m³)"], str) else row["Batch Weight (kg/m³)"], to_float=True)),
+                float(_clean_numeric_val(row["Batch Volume (L/m³)"].replace(" L/m³", "") if isinstance(row["Batch Volume (L/m³)"], str) else row["Batch Volume (L/m³)"], to_float=True)),
+                float(_clean_numeric_val(row["Determined Mass % (wt%)"].replace("%", "") if isinstance(row["Determined Mass % (wt%)"], str) else row["Determined Mass % (wt%)"], to_float=True)),
+                float(_clean_numeric_val(row["Determined Vol %"].replace("%", "") if isinstance(row["Determined Vol %"], str) else row["Determined Vol %"], to_float=True)),
+                float(_clean_numeric_val(row["Mix Proportion (1 : X)"].split()[0] if isinstance(row["Mix Proportion (1 : X)"], str) and row["Mix Proportion (1 : X)"][0].isdigit() else 0.0, to_float=True))
+            ))
+            
+        conn.commit()
+        conn.close()
+        return next_ver
 
 def load_all_samples():
-    conn = sqlite3.connect(DB_FILE)
-    df_samples = pd.read_sql_query("SELECT * FROM samples ORDER BY created_at DESC", conn)
-    conn.close()
+    mode = st.session_state.get("db_engine_mode", "Shared Local DB")
+    if mode == "Supabase (PostgreSQL)":
+        engine = get_connection()
+        try:
+            df_samples = pd.read_sql_query("SELECT * FROM samples ORDER BY created_at DESC", engine)
+        except Exception:
+            return pd.DataFrame()
+    else:
+        conn = get_connection()
+        df_samples = pd.read_sql_query("SELECT * FROM samples ORDER BY created_at DESC", conn)
+        conn.close()
     
     if not df_samples.empty:
         for num_col in ["total_points", "valid_points", "traverses_y_count", "transects_x_count"]:
             if num_col in df_samples.columns:
                 df_samples[num_col] = df_samples[num_col].apply(lambda v: _clean_numeric_val(v, to_float=False))
-                
         for float_col in ["bounding_area_mm2", "linear_traverse_mm", "traverse_spacing_um"]:
             if float_col in df_samples.columns:
                 df_samples[float_col] = df_samples[float_col].apply(lambda v: _clean_numeric_val(v, to_float=True))
-                
         for col in ["sample_id", "job_number", "sample_order", "sample_type", "operator", "lithology_code", "created_at", "updated_at"]:
             if col in df_samples.columns:
                 df_samples[col] = df_samples[col].astype(str)
@@ -450,9 +599,17 @@ def load_all_samples():
     return df_samples
 
 def load_sample_details(sample_id):
-    conn = sqlite3.connect(DB_FILE)
-    df_results = pd.read_sql_query("SELECT * FROM modal_results WHERE sample_id = ?", conn, params=(str(sample_id),))
-    conn.close()
+    mode = st.session_state.get("db_engine_mode", "Shared Local DB")
+    if mode == "Supabase (PostgreSQL)":
+        engine = get_connection()
+        try:
+            df_results = pd.read_sql_query(text("SELECT * FROM modal_results WHERE sample_id = :sid"), engine, params={"sid": str(sample_id)})
+        except Exception:
+            return pd.DataFrame()
+    else:
+        conn = get_connection()
+        df_results = pd.read_sql_query("SELECT * FROM modal_results WHERE sample_id = ?", conn, params=(str(sample_id),))
+        conn.close()
     
     if not df_results.empty:
         df_results["point_count"] = df_results["point_count"].apply(lambda v: _clean_numeric_val(v, to_float=False))
@@ -460,7 +617,6 @@ def load_sample_details(sample_id):
         df_results["std_error"] = df_results["std_error"].apply(lambda v: _clean_numeric_val(v, to_float=True))
         df_results["density_gcm3"] = df_results["density_gcm3"].apply(lambda v: _clean_numeric_val(v, to_float=True) if pd.notnull(v) else np.nan)
         df_results["wt_percent"] = df_results["wt_percent"].apply(lambda v: _clean_numeric_val(v, to_float=True) if pd.notnull(v) else np.nan)
-        
         for col in ["phase_name", "abundance", "functional_role", "en933_class", "carbonation", "liberation"]:
             if col in df_results.columns:
                 df_results[col] = df_results[col].astype(str).replace({"None": "", "nan": ""})
@@ -468,16 +624,19 @@ def load_sample_details(sample_id):
     return df_results
 
 def load_qc_metrics(sample_id):
-    conn = sqlite3.connect(DB_FILE)
-    df_qc = pd.read_sql_query("SELECT * FROM petro_qc_metrics WHERE sample_id = ?", conn, params=(str(sample_id),))
-    conn.close()
-    return df_qc.iloc[0].to_dict() if not df_qc.empty else {}
-
-def load_saved_mix_designs(sample_id):
-    conn = sqlite3.connect(DB_FILE)
-    df_mixes = pd.read_sql_query("SELECT * FROM concrete_mix_designs WHERE sample_id = ? ORDER BY version_number DESC", conn, params=(str(sample_id),))
-    conn.close()
-    return df_mixes
+    mode = st.session_state.get("db_engine_mode", "Shared Local DB")
+    if mode == "Supabase (PostgreSQL)":
+        engine = get_connection()
+        try:
+            df_qc = pd.read_sql_query(text("SELECT * FROM petro_qc_metrics WHERE sample_id = :sid"), engine, params={"sid": str(sample_id)})
+            return df_qc.iloc[0].to_dict() if not df_qc.empty else {}
+        except Exception:
+            return {}
+    else:
+        conn = get_connection()
+        df_qc = pd.read_sql_query("SELECT * FROM petro_qc_metrics WHERE sample_id = ?", conn, params=(str(sample_id),))
+        conn.close()
+        return df_qc.iloc[0].to_dict() if not df_qc.empty else {}
 
 # ---------------------------------------------------------
 # 1. SAMPLE TYPES, TAXONOMY & CODES
@@ -634,12 +793,7 @@ def calculate_spatial_index(df_points):
 def generate_petrography_pdf(meta_dict, df_summary, specific_metrics):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=36,
-        leftMargin=36,
-        topMargin=36,
-        bottomMargin=36
+        buffer, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36
     )
     
     styles = getSampleStyleSheet()
@@ -653,12 +807,10 @@ def generate_petrography_pdf(meta_dict, df_summary, specific_metrics):
     bold_style = ParagraphStyle('BoldBody', parent=body_style, fontName='Helvetica-Bold')
     
     story = []
-    
     story.append(Paragraph("Petrographic Modal Analysis & QC Report", title_style))
     story.append(Paragraph(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}", body_style))
     story.append(Spacer(1, 12))
     
-    # 1. Sample Reference Data
     story.append(Paragraph("1. Sample Reference & Metadata", h2_style))
     meta_table_data = [
         [
@@ -685,7 +837,6 @@ def generate_petrography_pdf(meta_dict, df_summary, specific_metrics):
     story.append(t_meta)
     story.append(Spacer(1, 14))
 
-    # 2. Key Petrographic Metrics (Traverse & Material-Specific)
     story.append(Paragraph("2. Point Count & Material Metrics", h2_style))
     metrics_rows = [
         [Paragraph(f"<b>{k}:</b>", body_style), Paragraph(str(v), body_style)]
@@ -701,7 +852,6 @@ def generate_petrography_pdf(meta_dict, df_summary, specific_metrics):
     story.append(t_metrics)
     story.append(Spacer(1, 14))
 
-    # 3. Modal Results Table
     story.append(Paragraph("3. Standardized Modal Composition Table", h2_style))
     col_names = ["Phase / Constituent", "Point Count", "Modal % (vol%)", "2-Sigma Err (±%)", "Abundance"]
     table_data = [[Paragraph(f"<b>{h}</b>", bold_style) for h in col_names]]
@@ -727,7 +877,6 @@ def generate_petrography_pdf(meta_dict, df_summary, specific_metrics):
     story.append(t_modal)
     story.append(Spacer(1, 16))
 
-    # 4. Graphical Modal Stacked Bar Chart
     story.append(Paragraph("4. Modal Distribution Graphic", h2_style))
     draw_w, draw_h = 520, 48
     d = Drawing(draw_w, draw_h)
@@ -741,13 +890,12 @@ def generate_petrography_pdf(meta_dict, df_summary, specific_metrics):
     cur_x = 0
     bar_y = 20
     bar_h = 24
-    
     legend_items = []
+    
     for i, (_, r) in enumerate(df_summary.iterrows()):
         p_name = str(r.get("Standardized_Phase", r.get("phase_name", "")))
         pct = float(r.get("Modal_Percent (%)", r.get("modal_percent", 0.0)))
         col = palette[i % len(palette)]
-        
         seg_w = (pct / 100.0) * draw_w
         if seg_w > 0:
             d.add(Rect(cur_x, bar_y, seg_w, bar_h, fillColor=col, strokeColor=colors.white, strokeWidth=1))
@@ -773,12 +921,7 @@ def generate_petrography_pdf(meta_dict, df_summary, specific_metrics):
 def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, mass_pcts):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=36,
-        leftMargin=36,
-        topMargin=36,
-        bottomMargin=36
+        buffer, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36
     )
     
     styles = getSampleStyleSheet()
@@ -792,12 +935,10 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
     bold_style = ParagraphStyle('BoldBody', parent=body_style, fontName='Helvetica-Bold')
     
     story = []
-    
     story.append(Paragraph("Concrete Mix Reverse-Engineering & Petrographic Report", title_style))
     story.append(Paragraph(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}", body_style))
     story.append(Spacer(1, 12))
     
-    # 1. Sample Metadata
     story.append(Paragraph("1. Sample Reference & Metadata", h2_style))
     meta_table_data = [
         [
@@ -828,7 +969,6 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
     story.append(t_meta)
     story.append(Spacer(1, 14))
 
-    # 2. Mix Proportions Table
     story.append(Paragraph("2. Reconstructed Concrete Mix Design (per 1 m³)", h2_style))
     col_names = ["Constituent", "Mass (kg/m³)", "Mass % (wt%)", "Vol (L/m³)", "Vol %", "Proportion (1:X)"]
     table_data = [[Paragraph(f"<b>{h}</b>", bold_style) for h in col_names]]
@@ -855,7 +995,6 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
     story.append(t_mix)
     story.append(Spacer(1, 14))
 
-    # 3. 100% Mass Distribution Graphic
     story.append(Paragraph("3. Concrete Mix Composition (100% Mass Distribution Graphic)", h2_style))
     draw_w, draw_h = 520, 48
     d = Drawing(draw_w, draw_h)
@@ -866,7 +1005,6 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
         ("Fine Agg", mass_pcts.get("Fine Agg", 0), colors.HexColor('#ff9900')),
         ("Coarse Agg", mass_pcts.get("Coarse Agg", 0), colors.HexColor('#dc3912'))
     ]
-    
     cur_x = 0
     bar_y = 20
     bar_h = 24
@@ -887,11 +1025,9 @@ def generate_mix_design_pdf(meta_dict, df_results, strength_dict, slump_dict, ma
     d.add(String(154, 6, "Fine Aggregate", fontName="Helvetica", fontSize=8))
     d.add(Rect(235, 4, 10, 10, fillColor=colors.HexColor('#dc3912'), strokeColor=None))
     d.add(String(249, 6, "Coarse Aggregate", fontName="Helvetica", fontSize=8))
-    
     story.append(d)
     story.append(Spacer(1, 16))
 
-    # 4. Performance
     story.append(Paragraph("4. Estimated Engineering Performance", h2_style))
     perf_data = [
         [
@@ -932,13 +1068,15 @@ active_id = st.session_state.get("active_sample_id", "No Active Sample")
 active_job = st.session_state.get("active_job_number", "None")
 active_type = st.session_state.get("active_sample_type", "General")
 active_status = "Committed to DB" if st.session_state.get("is_db_committed", False) else "Session Draft"
+active_db_label = get_db_info()
 
 st.markdown(f"""
 <div class="context-ribbon">
     <div>
         <b>🔬 Active Sample:</b> <span style="font-size:1.05rem; color:#85bbf0;">{active_id}</span> &nbsp;|&nbsp; 
         <b>Job:</b> {active_job} &nbsp;|&nbsp; 
-        <b>Material:</b> {active_type}
+        <b>Material:</b> {active_type} &nbsp;|&nbsp;
+        <b>Database:</b> <span style="color:#d1e7dd;">{active_db_label}</span>
     </div>
     <div>
         <span class="status-pill {'pill-green' if active_status == 'Committed to DB' else 'pill-amber'}">{active_status}</span>
@@ -955,7 +1093,7 @@ main_tab1, main_tab2, main_tab3, main_tab4, main_tab5, main_tab6, main_tab7 = st
     "🏗️ Concrete Mix Design (DB)", 
     "📊 Multi-Sample Comparison", 
     "🌐 Geological Drive Resources",
-    "📁 Local Database Browser",
+    "📁 Database Manager & Inspector",
     "ℹ️ Application Guide & DB Schema"
 ])
 
@@ -1013,7 +1151,6 @@ with main_tab1:
     if input_mode == "Upload New File (CSV/TSV)" and df_raw is not None:
         sample_id = str(df_raw["Image_File"].iloc[0]).split(".")[0]
 
-        # Geometry calculations
         df_raw["X_um"] = df_raw["X"] * SCALE_UM_PER_PX
         df_raw["Y_um"] = df_raw["Y"] * SCALE_UM_PER_PX
         x_min_um, x_max_um = df_raw["X_um"].min(), df_raw["X_um"].max()
@@ -1065,7 +1202,6 @@ with main_tab1:
 
             st.caption(f"ℹ️ {na_count} 'NA' points excluded. Valid point count: **{valid_points_count}**.")
 
-            # Compute summary early so both left_pane and right_pane can safely access it
             summary = df_valid.groupby("Standardized_Phase").size().reset_index(name="Point_Count")
             summary["Modal_Percent (%)"] = (summary["Point_Count"] / valid_points_count) * 100.0
             p = summary["Modal_Percent (%)"] / 100.0
@@ -1092,7 +1228,6 @@ with main_tab1:
                 df_valid["Carbonation"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["Carbonation"])
                 df_valid["Liberation"] = df_valid["Standardized_Phase"].map(lambda p: tagging_data[p]["Liberation"])
 
-            # Save & PDF export
             st.markdown("---")
             c_btn1, c_btn2 = st.columns(2)
             
@@ -1121,7 +1256,7 @@ with main_tab1:
                         
                     save_sample_to_db(meta_payload, summary_save, st.session_state.get("active_qc_metrics_payload"))
                     st.session_state["is_db_committed"] = True
-                    st.success(f"Sample '{sample_id}' and all QC metrics committed to database!")
+                    st.success(f"Sample '{sample_id}' and all QC metrics committed to database ({get_db_info()})!")
 
         with right_pane:
             st.subheader("📊 Live Analytical Viewport")
@@ -1185,7 +1320,6 @@ with main_tab1:
                 "qapf_norm_p": None
             }
 
-            # Evaluate ASR
             asr_res, asr_txt = evaluate_asr_risk(summary)
             qc_metrics_payload["asr_risk_rating"] = asr_res
             qc_metrics_payload["asr_risk_description"] = asr_txt
@@ -1242,7 +1376,6 @@ with main_tab1:
 
             st.session_state["active_qc_metrics_payload"] = qc_metrics_payload
 
-            # Tab 1 PDF Download Button in left pane
             with c_btn2:
                 try:
                     pdf_tab1_meta = {
@@ -1355,7 +1488,7 @@ with main_tab1:
 # =========================================================
 with main_tab2:
     st.header("⚖️ Database Aggregate Density & wt% DataGrid Editor")
-    st.info("Directly double-click cells in the interactive spreadsheet below to reassign specific densities (g/cm³). Weight percentages recalculate automatically.")
+    st.info(f"Directly double-click cells in the interactive spreadsheet below to reassign specific densities (g/cm³). Active DB: **{get_db_info()}**.")
 
     df_db_samples = load_all_samples()
     if not df_db_samples.empty:
@@ -1436,7 +1569,6 @@ with main_tab2:
                     "liberation": "Liberation"
                 })
                 
-                # Also commit updated ASR metric
                 qc_current = load_qc_metrics(selected_db_id)
                 qc_current["asr_risk_rating"] = re_asr_risk
                 qc_current["asr_risk_description"] = re_asr_desc
@@ -1494,7 +1626,6 @@ with main_tab3:
     if not df_mix_input.empty:
         st.markdown("---")
         
-        # 1. Config Ribbon
         with st.expander("⚙️ Component Classification & Physical Densities", expanded=False):
             def auto_classify(p_name):
                 p = str(p_name).lower()
@@ -1528,7 +1659,6 @@ with main_tab3:
         v_coarse = float(df_mix_input.loc[df_mix_input["Role"] == "Coarse Aggregate", "Vol_Pct"].sum())
         v_void = float(df_mix_input.loc[df_mix_input["Role"] == "Air Voids", "Vol_Pct"].sum())
 
-        # Parameters & SCM Proportional Replacement Sliders
         p_col1, p_col2 = st.columns([1, 1.2])
         with p_col1:
             wb_ratio = st.slider("Estimated w/b Ratio:", 0.25, 0.80, 0.48, 0.01)
@@ -1559,7 +1689,6 @@ with main_tab3:
                 st.error("⚠️ Total SCM replacement exceeds 100%! Please reduce slider proportions.")
                 st.stop()
 
-            # Harmonic mean calculation for composite effective binder density
             inv_rho_b = (
                 (pct_main / 100.0) / rho_main_binder +
                 (pct_ggbs / 100.0) / SCM_DENSITIES["GGBS"] +
@@ -1583,11 +1712,9 @@ with main_tab3:
             </div>
             """, unsafe_allow_html=True)
 
-        # Reconstructed batch physics
         rho_water = 1.00
         v_total_agg = v_fine + v_coarse
 
-        # Approach B (BS 1881-124)
         v_paste_avail_m3 = max(0.05, 1.0 - ((v_total_agg + v_void) / 100.0))
         denom_b = (1.0 / (rho_cement * 1000.0)) + (wb_ratio / (rho_water * 1000.0))
         c_kg_b = v_paste_avail_m3 / denom_b
@@ -1596,7 +1723,6 @@ with main_tab3:
         coarse_kg_b = 10.0 * v_coarse * rho_coarse
         fresh_density_b = c_kg_b + w_kg_b + fine_kg_b + coarse_kg_b
 
-        # Approach A (Powers-Brownyard)
         v_c0_pct = v_paste / (1.0 + wb_ratio * (rho_cement / rho_water)) if (1.0 + wb_ratio * (rho_cement / rho_water)) > 0 else 0
         c_kg_a = 10.0 * v_c0_pct * rho_cement
         w_kg_a = c_kg_a * wb_ratio
@@ -1634,7 +1760,6 @@ with main_tab3:
         prop_coarse = coarse_kg / c_kg if c_kg > 0 else 0.0
         total_agg_ratio = prop_fine + prop_coarse
 
-        # ------------------ BENTO 2X2 ANALYTICAL GRID ------------------
         bento_r1_c1, bento_r1_c2 = st.columns(2)
         
         with bento_r1_c1:
@@ -1727,7 +1852,6 @@ with main_tab3:
             </div>
             """, unsafe_allow_html=True)
 
-        # Dedicated Save Concrete Mix Scenario to DB Button
         st.markdown("---")
         c_mix_save, c_mix_pdf = st.columns(2)
 
@@ -1757,9 +1881,8 @@ with main_tab3:
                     "slump_class": slump_class
                 }
                 saved_ver = save_concrete_mix_design_to_db(mix_db_payload, df_mix_res)
-                st.success(f"Mix Design Scenario v{saved_ver} successfully committed to database!")
+                st.success(f"Mix Design Scenario v{saved_ver} successfully committed to database ({get_db_info()})!")
 
-        # PDF Export
         with c_mix_pdf:
             pdf_meta = {
                 "sample_id": mix_sample_label, "job_number": cur_job_num, "sample_order": cur_sample_ord,
@@ -1787,7 +1910,7 @@ with main_tab3:
 # =========================================================
 with main_tab4:
     st.header("📊 Multi-Sample Comparative Analysis Dashboard")
-    st.info("Compare petrographic results across multiple samples of the same sample type.")
+    st.info(f"Compare petrographic results across multiple samples of the same sample type. Active DB: **{get_db_info()}**.")
     
     df_samples = load_all_samples()
     if not df_samples.empty:
@@ -1796,7 +1919,7 @@ with main_tab4:
         st.write(f"Found **{len(filtered_s)}** samples for type: **{comp_type}**")
         st.dataframe(filtered_s, width="stretch")
     else:
-        st.info("No saved database samples available.")
+        st.info("No saved database samples available in the current database.")
 
 # =========================================================
 # TAB 5: GEOLOGICAL DRIVE RESOURCES PLACEHOLDER
@@ -1808,10 +1931,88 @@ with main_tab5:
     st.button("🔗 Connect to Google Workspace Drive")
 
 # =========================================================
-# TAB 6: LOCAL DATABASE BROWSER (MULTI-ENTITY INSPECTOR)
+# TAB 6: 3-TIER DATABASE MANAGER & INSPECTOR
 # =========================================================
 with main_tab6:
-    st.subheader("📁 Saved Geological Database Records Inspector")
+    st.header("📁 Database Engine Manager & Record Inspector")
+    
+    st.markdown("### 1. Select Active Database Tier")
+    db_tier = st.radio(
+        "Choose Database Tier to Operate Against:",
+        ["Shared Local DB (Default SQLite)", "Personal Portable DB (Upload / Export .db)", "Supabase Network DB (Direct PostgreSQL)"],
+        index=0 if st.session_state["db_engine_mode"] == "Shared Local DB" else (
+              1 if st.session_state["db_engine_mode"] == "Personal DB" else 2),
+        horizontal=True
+    )
+    
+    if "Shared Local" in db_tier:
+        st.session_state["db_engine_mode"] = "Shared Local DB"
+        st.info("Operating against the host filesystem SQLite database (`petrography_data.db`). Suitable for testing and quick analyses.")
+    elif "Personal Portable" in db_tier:
+        st.session_state["db_engine_mode"] = "Personal DB"
+        st.info("Operating in Personal Database mode. Download your complete database to your computer, or upload a previously saved file to replace the active session completely.")
+        
+        c_pers1, c_pers2 = st.columns(2)
+        with c_pers1:
+            st.write("##### 📥 Export / Download Working DB")
+            target_path = get_sqlite_target_path()
+            if os.path.exists(target_path):
+                with open(target_path, "rb") as f:
+                    db_bytes = f.read()
+                today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+                st.download_button(
+                    label="📥 Download Active SQLite Database (.db)",
+                    data=db_bytes,
+                    file_name=f"petrography_backup_{today_str}.db",
+                    mime="application/x-sqlite3",
+                    type="primary"
+                )
+            else:
+                st.warning("No database file found on disk to download.")
+                
+        with c_pers2:
+            st.write("##### 📤 Import Personal Database (Complete Replacement)")
+            uploaded_db = st.file_uploader("Upload Personal Database File (.db, .sqlite)", type=["db", "sqlite"], key="personal_db_upload")
+            if uploaded_db is not None:
+                # Save uploaded binary stream into personal session storage
+                session_db_filename = f"personal_{uploaded_db.name}"
+                with open(session_db_filename, "wb") as f_out:
+                    f_out.write(uploaded_db.getbuffer())
+                    
+                st.session_state["personal_db_path"] = session_db_filename
+                init_db(session_db_filename)
+                st.success(f"Successfully loaded '{uploaded_db.name}'! All views updated to this personal database.")
+                st.rerun()
+                
+    else:
+        st.session_state["db_engine_mode"] = "Supabase (PostgreSQL)"
+        st.info("Operating via Direct PostgreSQL over Supabase Connection Pooler (`port 6543`).")
+        
+        sup_conn_input = st.text_input(
+            "Supabase / PostgreSQL Connection String (Pooler Port 6543):",
+            value=st.session_state.get("supabase_conn_str", ""),
+            type="password",
+            placeholder="postgresql+psycopg2://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres"
+        )
+        
+        c_sup1, c_sup2 = st.columns([1, 3])
+        with c_sup1:
+            if st.button("🔗 Test Connection & Switch", type="primary"):
+                st.session_state["supabase_conn_str"] = sup_conn_input
+                try:
+                    eng = create_engine(sup_conn_input)
+                    with eng.connect() as test_conn:
+                        res = test_conn.execute(text("SELECT 1;"))
+                        val = res.scalar()
+                    st.success("✅ Connected successfully to Supabase PostgreSQL!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Connection failed: {e}")
+        with c_sup2:
+            st.caption("ℹ️ Use Supavisor connection pooler URI on port `6543` to avoid connection exhaustion on Streamlit Cloud.")
+
+    st.markdown("---")
+    st.markdown(f"### 2. Multi-Entity Table Inspector ({get_db_info()})")
     
     db_view_tab1, db_view_tab2, db_view_tab3 = st.tabs([
         "Master Samples & Modal History", 
@@ -1830,13 +2031,21 @@ with main_tab6:
                 st.write(f"##### Modal Breakdown for: **{selected_sample}**")
                 st.dataframe(df_modal_history, width="stretch")
         else:
-            st.info("No saved samples found in the database yet.")
+            st.info("No saved samples found in the active database tier.")
 
     with db_view_tab2:
         if not df_history.empty:
-            conn = sqlite3.connect(DB_FILE)
-            df_qc_all = pd.read_sql_query("SELECT * FROM petro_qc_metrics ORDER BY calculated_at DESC", conn)
-            conn.close()
+            mode = st.session_state.get("db_engine_mode", "Shared Local DB")
+            if mode == "Supabase (PostgreSQL)":
+                try:
+                    df_qc_all = pd.read_sql_query("SELECT * FROM petro_qc_metrics ORDER BY calculated_at DESC", get_connection())
+                except Exception:
+                    df_qc_all = pd.DataFrame()
+            else:
+                conn = get_connection()
+                df_qc_all = pd.read_sql_query("SELECT * FROM petro_qc_metrics ORDER BY calculated_at DESC", conn)
+                conn.close()
+                
             if not df_qc_all.empty:
                 st.dataframe(df_qc_all, width="stretch")
             else:
@@ -1846,16 +2055,27 @@ with main_tab6:
 
     with db_view_tab3:
         if not df_history.empty:
-            conn = sqlite3.connect(DB_FILE)
-            df_mix_all = pd.read_sql_query("SELECT * FROM concrete_mix_designs ORDER BY committed_at DESC", conn)
-            conn.close()
+            mode = st.session_state.get("db_engine_mode", "Shared Local DB")
+            if mode == "Supabase (PostgreSQL)":
+                try:
+                    df_mix_all = pd.read_sql_query("SELECT * FROM concrete_mix_designs ORDER BY committed_at DESC", get_connection())
+                except Exception:
+                    df_mix_all = pd.DataFrame()
+            else:
+                conn = get_connection()
+                df_mix_all = pd.read_sql_query("SELECT * FROM concrete_mix_designs ORDER BY committed_at DESC", conn)
+                conn.close()
+                
             if not df_mix_all.empty:
                 st.dataframe(df_mix_all, width="stretch")
                 sel_mix_id = st.selectbox("Select Mix Scenario ID to inspect constituent breakdown:", df_mix_all["mix_id"].unique())
                 if sel_mix_id:
-                    conn = sqlite3.connect(DB_FILE)
-                    df_bdown = pd.read_sql_query("SELECT * FROM mix_design_breakdown WHERE mix_id = ?", conn, params=(int(sel_mix_id),))
-                    conn.close()
+                    if mode == "Supabase (PostgreSQL)":
+                        df_bdown = pd.read_sql_query(text("SELECT * FROM mix_design_breakdown WHERE mix_id = :mid"), get_connection(), params={"mid": int(sel_mix_id)})
+                    else:
+                        conn = get_connection()
+                        df_bdown = pd.read_sql_query("SELECT * FROM mix_design_breakdown WHERE mix_id = ?", conn, params=(int(sel_mix_id),))
+                        conn.close()
                     st.write(f"##### Batch Breakdown for Scenario Mix ID #{sel_mix_id}")
                     st.dataframe(df_bdown, width="stretch")
             else:
@@ -1890,8 +2110,8 @@ with main_tab7:
         * **Tab 5: 🌐 Geological Drive Resources**  
           *Cloud repository integration.* Connects to shared Google Drive folders for rapid reference to standard optical atlases and testing protocols.
           
-        * **Tab 6: 📁 Local Database Browser**  
-          *Master database record inspection.* Browse parent `samples`, child `modal_results`, `petro_qc_metrics`, and versioned `concrete_mix_designs` scenarios.
+        * **Tab 6: 📁 Database Manager & Inspector**  
+          *3-Tier database engine manager.* Switch between the shared default local SQLite database, personal portable `.db` file exports/imports, and direct PostgreSQL network connections to Supabase.
         """)
         
     st.markdown("---")
