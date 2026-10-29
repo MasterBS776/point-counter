@@ -534,9 +534,8 @@ def generate_petrography_pdf(meta_dict, df_summary, specific_metrics):
             cur_x += seg_w
             legend_items.append((p_name, col))
 
-    # Compact legend
     leg_x = 0
-    for p_name, col in legend_items[:5]:  # show up to 5 main items
+    for p_name, col in legend_items[:5]:
         d.add(Rect(leg_x, 4, 8, 8, fillColor=col, strokeColor=None))
         d.add(String(leg_x + 12, 5, p_name[:15], fontName="Helvetica", fontSize=7))
         leg_x += 100
@@ -790,30 +789,32 @@ with main_tab1:
 
     # ------------------ SPLIT PANE WORKFLOW ------------------
     if input_mode == "Upload New File (CSV/TSV)" and df_raw is not None:
+        sample_id = str(df_raw["Image_File"].iloc[0]).split(".")[0]
+
+        # Geometry calculations
+        df_raw["X_um"] = df_raw["X"] * SCALE_UM_PER_PX
+        df_raw["Y_um"] = df_raw["Y"] * SCALE_UM_PER_PX
+        x_min_um, x_max_um = df_raw["X_um"].min(), df_raw["X_um"].max()
+        y_min_um, y_max_um = df_raw["Y_um"].min(), df_raw["Y_um"].max()
+        width_mm = (x_max_um - x_min_um) / 1000.0
+        height_mm = (y_max_um - y_min_um) / 1000.0
+        area_mm2 = width_mm * height_mm
+
+        unique_y = np.sort(df_raw["Y_um"].unique())
+        unique_x = np.sort(df_raw["X_um"].unique())
+        num_traverses = len(unique_y)
+        num_transects = len(unique_x)
+        total_linear_traverse_mm = num_traverses * width_mm
+
         left_pane, right_pane = st.columns([4, 6])
         
         with left_pane:
             st.subheader("📋 Ingestion & Geometry")
-            sample_id = st.text_input("Sample ID", value=str(df_raw["Image_File"].iloc[0]).split(".")[0])
+            sample_id = st.text_input("Sample ID", value=sample_id)
             
             litho_tag = ""
             if sample_type == "Concrete - I.S.465":
                 litho_tag = st.selectbox("I.S. 465 Main Lithology Tag", IS465_LITHOLOGY_CODES)
-
-            # Traverse calculations
-            df_raw["X_um"] = df_raw["X"] * SCALE_UM_PER_PX
-            df_raw["Y_um"] = df_raw["Y"] * SCALE_UM_PER_PX
-            x_min_um, x_max_um = df_raw["X_um"].min(), df_raw["X_um"].max()
-            y_min_um, y_max_um = df_raw["Y_um"].min(), df_raw["Y_um"].max()
-            width_mm = (x_max_um - x_min_um) / 1000.0
-            height_mm = (y_max_um - y_min_um) / 1000.0
-            area_mm2 = width_mm * height_mm
-
-            unique_y = np.sort(df_raw["Y_um"].unique())
-            unique_x = np.sort(df_raw["X_um"].unique())
-            num_traverses = len(unique_y)
-            num_transects = len(unique_x)
-            total_linear_traverse_mm = num_traverses * width_mm
 
             st.markdown(f"""
             <div class="metric-card">
@@ -836,12 +837,23 @@ with main_tab1:
             df_mapped = df_raw.copy()
             df_mapped["Standardized_Phase"] = df_mapped["Raw_Term"].map(mapping_dict)
             df_valid = df_mapped[df_mapped["Standardized_Phase"].str.upper() != "NA"].copy()
-            valid_points_count = len(df_valid)
-            na_count = len(df_mapped) - valid_points_count
+            valid_points_count = max(1, len(df_valid))
+            na_count = len(df_mapped) - len(df_valid)
 
             st.caption(f"ℹ️ {na_count} 'NA' points excluded. Valid point count: **{valid_points_count}**.")
 
-            # Recycled aggregate phase tagging
+            # Compute summary early so both left_pane and right_pane can safely access it
+            summary = df_valid.groupby("Standardized_Phase").size().reset_index(name="Point_Count")
+            summary["Modal_Percent (%)"] = (summary["Point_Count"] / valid_points_count) * 100.0
+            p = summary["Modal_Percent (%)"] / 100.0
+            summary["Std_Error (%)"] = 2.0 * np.sqrt((p * (1.0 - p)) / valid_points_count) * 100.0
+
+            if sample_type in ["Aggregates", "Aggregate - Recycled", "Rock"]:
+                summary["Abundance"] = summary["Modal_Percent (%)"].apply(classify_abundance)
+
+            summary["Modal_Percent (%)"] = summary["Modal_Percent (%)"].round(2)
+            summary["Std_Error (%)"] = summary["Std_Error (%)"].round(2)
+
             tagging_data = {}
             if sample_type == "Aggregate - Recycled":
                 st.write("##### EN 933-11 Classification Tags")
@@ -887,18 +899,6 @@ with main_tab1:
 
         with right_pane:
             st.subheader("📊 Live Analytical Viewport")
-            
-            # Modal Analysis Computation
-            summary = df_valid.groupby("Standardized_Phase").size().reset_index(name="Point_Count")
-            summary["Modal_Percent (%)"] = (summary["Point_Count"] / valid_points_count) * 100
-            p = summary["Modal_Percent (%)"] / 100
-            summary["Std_Error (%)"] = 2 * np.sqrt((p * (1 - p)) / valid_points_count) * 100
-
-            if sample_type in ["Aggregates", "Aggregate - Recycled", "Rock"]:
-                summary["Abundance"] = summary["Modal_Percent (%)"].apply(classify_abundance)
-
-            summary["Modal_Percent (%)"] = summary["Modal_Percent (%)"].round(2)
-            summary["Std_Error (%)"] = summary["Std_Error (%)"].round(2)
 
             st.session_state["active_sample_id"] = sample_id
             st.session_state["active_summary"] = summary.copy()
@@ -909,6 +909,8 @@ with main_tab1:
 
             tab_plot1, tab_plot2, tab_plot3 = st.tabs(["📍 Spatial Distribution Map", "📊 Modal Percentages", "🧱 I.S. 465 / Standards"])
 
+            R_val, R_desc = calculate_spatial_index(df_valid)
+
             with tab_plot1:
                 fig_scatter = px.scatter(
                     df_valid, x="X_um", y="Y_um", color="Standardized_Phase",
@@ -918,7 +920,6 @@ with main_tab1:
                 fig_scatter.update_layout(height=420)
                 st.plotly_chart(fig_scatter, width="stretch")
 
-                R_val, R_desc = calculate_spatial_index(df_valid)
                 if R_val is not None:
                     st.markdown(f"""
                     <div class="metric-card">
@@ -937,24 +938,24 @@ with main_tab1:
                 st.plotly_chart(fig_bar, width="stretch")
                 st.dataframe(summary, width="stretch")
 
+            specific_metrics = {
+                "Total Points Counted": len(df_raw),
+                "Valid Phase Points": valid_points_count,
+                "Slide Bounding Area": f"{area_mm2:.2f} mm²",
+                "Total Traverse Length": f"{total_linear_traverse_mm:.1f} mm",
+                "Clark-Evans Ratio (R)": f"{R_val:.3f} ({R_desc})" if R_val else "N/A"
+            }
+
             with tab_plot3:
-                specific_metrics = {
-                    "Total Points Counted": len(df_raw),
-                    "Valid Phase Points": valid_points_count,
-                    "Slide Bounding Area": f"{area_mm2:.2f} mm²",
-                    "Total Traverse Length": f"{total_linear_traverse_mm:.1f} mm",
-                    "Clark-Evans Ratio (R)": f"{R_val:.3f} ({R_desc})" if R_val else "N/A"
-                }
-                
                 if sample_type == "Concrete - I.S.465":
                     good_agg_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Good Aggregate", case=False), "Point_Count"].sum()
                     bad_agg_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Bad Aggregate", case=False), "Point_Count"].sum()
                     total_agg_cnt = good_agg_cnt + bad_agg_cnt
 
                     if total_agg_cnt > 0:
-                        total_agg_pct = (total_agg_cnt / valid_points_count) * 100
-                        pct_good_of_agg = (good_agg_cnt / total_agg_cnt) * 100
-                        pct_bad_of_agg = (bad_agg_cnt / total_agg_cnt) * 100
+                        total_agg_pct = (total_agg_cnt / valid_points_count) * 100.0
+                        pct_good_of_agg = (good_agg_cnt / total_agg_cnt) * 100.0
+                        pct_bad_of_agg = (bad_agg_cnt / total_agg_cnt) * 100.0
 
                         st.metric("Total Aggregate Fraction", f"{total_agg_pct:.2f} %")
                         c_iso1, c_iso2 = st.columns(2)
@@ -970,9 +971,9 @@ with main_tab1:
                     p_cnt = summary.loc[summary["Standardized_Phase"].str.contains("Plagioclase", case=False), "Point_Count"].sum()
                     qap_sum = q_cnt + a_cnt + p_cnt
                     if qap_sum > 0:
-                        norm_q = (q_cnt / qap_sum) * 100
-                        norm_a = (a_cnt / qap_sum) * 100
-                        norm_p = (p_cnt / qap_sum) * 100
+                        norm_q = (q_cnt / qap_sum) * 100.0
+                        norm_a = (a_cnt / qap_sum) * 100.0
+                        norm_p = (p_cnt / qap_sum) * 100.0
 
                         fig_ternary = go.Figure(go.Scatterternary({
                             'mode': 'markers', 'a': [norm_q], 'b': [norm_a], 'c': [norm_p],
@@ -1030,10 +1031,10 @@ with main_tab1:
                 new_names.append(n_name)
             df_modal_edit["phase_name"] = new_names
             
-            valid_tot = df_modal_edit["point_count"].sum()
+            valid_tot = max(1, df_modal_edit["point_count"].sum())
             df_modal_edit["modal_percent"] = (df_modal_edit["point_count"] / valid_tot * 100.0).round(2)
             p = df_modal_edit["modal_percent"] / 100.0
-            df_modal_edit["std_error"] = (2 * np.sqrt((p * (1 - p)) / valid_tot) * 100.0).round(2)
+            df_modal_edit["std_error"] = (2.0 * np.sqrt((p * (1.0 - p)) / valid_tot) * 100.0).round(2)
 
             st.session_state["active_sample_id"] = sample_id
             st.session_state["active_summary"] = df_modal_edit.rename(columns={"phase_name": "Standardized_Phase", "modal_percent": "Modal_Percent (%)"}).copy()
@@ -1188,7 +1189,7 @@ with main_tab2:
 # =========================================================
 with main_tab3:
     st.header("🏗️ Hardened Concrete Mix Reverse-Engineering & Performance Engine")
-    st.info("Convert stereological area fractions into batch quantities ($1\\text{ m}^3$), 28-day cube strengths, and slump workability classes.")
+    st.info(r"Convert stereological area fractions into batch quantities ($1\text{ m}^3$), 28-day cube strengths, and slump workability classes.")
 
     mix_source = st.radio("Select Modal Data Source:", ["Active Session Point Count", "Load Sample from Database"], horizontal=True)
 
@@ -1297,7 +1298,6 @@ with main_tab3:
                 st.stop()
 
             # Harmonic mean calculation for composite effective binder density
-            # 1 / rho_b = sum(f_i / rho_i)
             inv_rho_b = (
                 (pct_main / 100.0) / rho_main_binder +
                 (pct_ggbs / 100.0) / SCM_DENSITIES["GGBS"] +
@@ -1540,7 +1540,7 @@ with main_tab7:
     st.markdown("### 📘 Functional Tab Overview & User Guide")
     col_g1, col_g2 = st.columns(2)
     with col_g1:
-        st.markdown("""
+        st.markdown(r"""
         * **Tab 1: 🔬 Sample Point Count Analysis**  
           *Ingest, standardize, and analyze raw optical counter coordinates.* Use the split-pane interface to standardise terms and evaluate Van der Plas & Tobi 2-sigma bounds, Clark-Evans spatial dispersion, and I.S. 465 good vs. bad aggregate ratios. Export dedicated petrographic reports to PDF.
         
